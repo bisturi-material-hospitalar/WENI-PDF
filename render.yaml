@@ -1,0 +1,43 @@
+# Blueprint do Render. Com este arquivo no repositório, o Render configura o
+# serviço sozinho (Dashboard -> New -> Blueprint).
+#
+# As variáveis marcadas com sync:false NÃO ficam no arquivo: o Render pede o
+# valor na interface, na criação. É assim que credencial não vai pro git.
+services:
+  - type: web
+    name: bridge-danfe
+    runtime: python
+    plan: free
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn bridge_danfe:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
+      # --- fixos, podem ficar no arquivo ---
+      - key: STORAGE_BACKEND
+        value: sftp
+      - key: SFTP_HOST
+        value: arquivos-bisturi-com-br.umbler.net
+      - key: SFTP_PORT
+        value: "22"
+      - key: SFTP_USER
+        value: umbler
+      - key: SFTP_BASE_DIR
+        value: /public_html/danfe
+      - key: PUBLIC_BASE_URL
+        value: https://arquivos.bisturi.com.br/danfe
+      - key: VTEX_ENVIRONMENT
+        value: vtexcommercestable
+      # --- segredos: preencher na interface do Render ---
+      - key: BRIDGE_TOKEN
+        sync: false
+      - key: SFTP_PASSWORD
+        sync: false
+      - key: VTEX_ACCOUNT
+        sync: false
+      - key: VTEX_APP_KEY
+        sync: false
+      - key: VTEX_APP_TOKEN
+        sync: false

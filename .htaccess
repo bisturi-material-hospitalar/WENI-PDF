@@ -1,0 +1,13 @@
+# Salve este conteúdo como .htaccess dentro da pasta /public_html/danfe
+# no servidor da Umbler. OBRIGATÓRIO.
+#
+# Sem isso, qualquer pessoa pode abrir https://arquivos.bisturi.com.br/danfe/
+# e ver a LISTA de todos os PDFs de nota fiscal — e aí o nome de arquivo
+# imprevisível (a chave da NF-e) não protege nada.
+
+Options -Indexes
+
+# Impede que o navegador/proxy guarde cópia em cache por muito tempo
+<FilesMatch "\.pdf$">
+    Header set Cache-Control "private, max-age=3600"
+</FilesMatch>

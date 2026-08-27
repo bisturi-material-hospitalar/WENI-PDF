@@ -1,0 +1,9 @@
+# Versões efetivamente testadas na geração dos DANFEs reais da Bisturi.
+# brazilfiscalreport e paramiko estão fixados porque são o núcleo do serviço;
+# se precisar atualizar, gere um PDF de teste antes de subir.
+fastapi==0.141.1
+uvicorn[standard]
+brazilfiscalreport==1.0.2
+paramiko==5.0.0
+requests==2.33.1
+pydantic==2.13.4
