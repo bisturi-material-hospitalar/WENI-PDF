@@ -28,8 +28,10 @@ Variáveis de ambiente (nada de credencial no código):
     VTEX_ENVIRONMENT      default vtexcommercestable
     VTEX_APP_KEY          X-VTEX-API-AppKey
     VTEX_APP_TOKEN        X-VTEX-API-AppToken
-    STORAGE_BACKEND       "sftp" (hospedagem Umbler) ou "s3" (R2/S3)
+    STORAGE_BACKEND       "sftp" / "ftps" (hospedagem Umbler) ou "s3" (R2/S3)
     -- se sftp:  SFTP_HOST, SFTP_PORT, SFTP_USER, SFTP_PASSWORD (ou SFTP_KEY_PATH),
+                 SFTP_BASE_DIR, PUBLIC_BASE_URL
+    -- se ftps:  SFTP_HOST, FTPS_PORT (default 21), SFTP_USER, SFTP_PASSWORD,
                  SFTP_BASE_DIR, PUBLIC_BASE_URL
     -- se s3:    R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
                  URL_EXPIRA_SEGUNDOS (default 604800 = 7 dias)
@@ -214,6 +216,10 @@ def gerar_pdf(xml_content: str) -> bytes:
 STORAGE_BACKEND = os.environ.get("STORAGE_BACKEND", "sftp").lower()
 
 
+import io
+from ftplib import FTP, FTP_TLS, error_perm
+
+
 def _sftp():
     import paramiko
 
@@ -281,6 +287,80 @@ def _sftp_subir(pdf_bytes: bytes, chave: str) -> str:
         transport.close()
 
 
+class _FTPSReuse(FTP_TLS):
+    """Reaproveita a sessão TLS no canal de dados — muitos servidores FTPS exigem."""
+    def ntransfercmd(self, cmd, rest=None):
+        conn, size = FTP.ntransfercmd(self, cmd, rest)
+        if self._prot_p:
+            conn = self.context.wrap_socket(
+                conn, server_hostname=self.host, session=self.sock.session
+            )
+        return conn, size
+
+
+def _ftps():
+    ftps = _FTPSReuse()
+    ftps.connect(os.environ["SFTP_HOST"], int(os.environ.get("FTPS_PORT", 21)), timeout=30)
+    ftps.login(os.environ["SFTP_USER"], os.environ["SFTP_PASSWORD"])
+    ftps.prot_p()          # criptografa o canal de dados
+    ftps.set_pasv(True)    # passivo: obrigatório saindo de container
+    return ftps
+
+
+def _ftps_fechar(ftps):
+    try:
+        ftps.quit()
+    except Exception:
+        ftps.close()
+
+
+def _ftps_cd(ftps, pasta: str, criar: bool = False):
+    ftps.cwd("/")
+    for parte in [p for p in pasta.split("/") if p]:
+        try:
+            ftps.cwd(parte)
+        except error_perm:
+            if not criar:
+                raise
+            ftps.mkd(parte)
+            ftps.cwd(parte)
+
+
+def _ftps_existe(chave: str) -> bool:
+    ftps = _ftps()
+    try:
+        pasta, nome = _sftp_remote_path(chave).rsplit("/", 1)
+        try:
+            _ftps_cd(ftps, pasta)
+        except error_perm:
+            return False
+        ftps.voidcmd("TYPE I")
+        try:
+            ftps.size(nome)
+            return True
+        except error_perm:
+            return False
+    finally:
+        _ftps_fechar(ftps)
+
+
+def _ftps_subir(pdf_bytes: bytes, chave: str) -> str:
+    ftps = _ftps()
+    try:
+        pasta, nome = _sftp_remote_path(chave).rsplit("/", 1)
+        _ftps_cd(ftps, pasta, criar=True)
+        tmp = nome + ".part"
+        ftps.storbinary(f"STOR {tmp}", io.BytesIO(pdf_bytes))
+        try:
+            ftps.delete(nome)
+        except error_perm:
+            pass
+        ftps.rename(tmp, nome)
+        return _sftp_public_url(chave)
+    finally:
+        _ftps_fechar(ftps)
+
+
 def _s3():
     import boto3
     from botocore.config import Config
@@ -331,19 +411,21 @@ def _s3_subir(pdf_bytes: bytes, chave: str) -> str:
 
 # ---- interface usada pelo endpoint (independente do back-end) ----
 def ja_existe(chave: str) -> bool:
+    if STORAGE_BACKEND == "ftps":
+        return _ftps_existe(chave)
     return _sftp_existe(chave) if STORAGE_BACKEND == "sftp" else _s3_existe(chave)
 
 
 def url_publica(chave: str) -> str:
-    return _sftp_public_url(chave) if STORAGE_BACKEND == "sftp" else _s3_url(chave)
+    if STORAGE_BACKEND in ("ftps", "sftp"):
+        return _sftp_public_url(chave)
+    return _s3_url(chave)
 
 
 def subir_pdf(pdf_bytes: bytes, chave: str) -> str:
-    return (
-        _sftp_subir(pdf_bytes, chave)
-        if STORAGE_BACKEND == "sftp"
-        else _s3_subir(pdf_bytes, chave)
-    )
+    if STORAGE_BACKEND == "ftps":
+        return _ftps_subir(pdf_bytes, chave)
+    return _sftp_subir(pdf_bytes, chave) if STORAGE_BACKEND == "sftp" else _s3_subir(pdf_bytes, chave)
 
 
 def expurgar_antigos(dias: int = 7) -> int:
