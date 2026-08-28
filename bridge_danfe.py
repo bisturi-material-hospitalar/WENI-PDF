@@ -45,6 +45,7 @@ STATUS DOS TESTES
 import os
 import re
 import xml.etree.ElementTree as ET
+from datetime import date, timedelta
 from typing import List, Optional
 
 import requests
@@ -54,6 +55,32 @@ from pydantic import BaseModel
 NS = {"nfe": "http://www.portalfiscal.inf.br/nfe"}
 STATUS_AUTORIZADOS = {"100", "150"}
 TIMEOUT = 30
+
+# Pedido do site: só dígitos e o sufixo -NN. Pedido com prefixo de letras
+# (ex.: PGM-1657548196767-01) é de outra operação e não passa por aqui.
+# A regra é "não tem letra nenhuma", não "não tem três letras": se amanhã
+# aparecer prefixo de duas ou quatro letras, continua valendo.
+RE_PEDIDO_SITE = re.compile(r"\d+-\d+")
+
+# Varredura automática: quantas notas gerar por execução e quantos dias
+# para trás considerar na listagem.
+PREGERAR_LIMITE = int(os.environ.get("PREGERAR_LIMITE", 20))
+PREGERAR_DIAS = int(os.environ.get("PREGERAR_DIAS", 3))
+
+# orderIds já resolvidos nesta instância. Evita buscar o mesmo pedido na VTEX
+# a cada varredura. Some quando o container reinicia, e isso é inofensivo:
+# a execução seguinte apenas confere de novo.
+_PREGERADOS = set()
+
+
+def pedido_do_site(order_id: str) -> bool:
+    return bool(RE_PEDIDO_SITE.fullmatch((order_id or "").strip()))
+
+
+def checar_token(authorization: Optional[str]) -> None:
+    esperado = os.environ.get("BRIDGE_TOKEN")
+    if not esperado or authorization != f"Bearer {esperado}":
+        raise HTTPException(401, "Não autorizado.")
 
 app = FastAPI(title="Bridge DANFE", version="1.0")
 
@@ -326,8 +353,11 @@ def _ftps_cd(ftps, pasta: str, criar: bool = False):
             ftps.cwd(parte)
 
 
-def _ftps_existe(chave: str) -> bool:
-    ftps = _ftps()
+def _ftps_existe(chave: str, ftps=None) -> bool:
+    # ftps != None: reaproveita a conexão do lote (usado pela varredura)
+    proprio = ftps is None
+    if proprio:
+        ftps = _ftps()
     try:
         pasta, nome = _sftp_remote_path(chave).rsplit("/", 1)
         try:
@@ -341,11 +371,14 @@ def _ftps_existe(chave: str) -> bool:
         except error_perm:
             return False
     finally:
-        _ftps_fechar(ftps)
+        if proprio:
+            _ftps_fechar(ftps)
 
 
-def _ftps_subir(pdf_bytes: bytes, chave: str) -> str:
-    ftps = _ftps()
+def _ftps_subir(pdf_bytes: bytes, chave: str, ftps=None) -> str:
+    proprio = ftps is None
+    if proprio:
+        ftps = _ftps()
     try:
         pasta, nome = _sftp_remote_path(chave).rsplit("/", 1)
         _ftps_cd(ftps, pasta, criar=True)
@@ -358,7 +391,8 @@ def _ftps_subir(pdf_bytes: bytes, chave: str) -> str:
         ftps.rename(tmp, nome)
         return _sftp_public_url(chave)
     finally:
-        _ftps_fechar(ftps)
+        if proprio:
+            _ftps_fechar(ftps)
 
 
 def _s3():
@@ -410,9 +444,9 @@ def _s3_subir(pdf_bytes: bytes, chave: str) -> str:
 
 
 # ---- interface usada pelo endpoint (independente do back-end) ----
-def ja_existe(chave: str) -> bool:
+def ja_existe(chave: str, conn=None) -> bool:
     if STORAGE_BACKEND == "ftps":
-        return _ftps_existe(chave)
+        return _ftps_existe(chave, conn)
     return _sftp_existe(chave) if STORAGE_BACKEND == "sftp" else _s3_existe(chave)
 
 
@@ -422,9 +456,9 @@ def url_publica(chave: str) -> str:
     return _s3_url(chave)
 
 
-def subir_pdf(pdf_bytes: bytes, chave: str) -> str:
+def subir_pdf(pdf_bytes: bytes, chave: str, conn=None) -> str:
     if STORAGE_BACKEND == "ftps":
-        return _ftps_subir(pdf_bytes, chave)
+        return _ftps_subir(pdf_bytes, chave, conn)
     return _sftp_subir(pdf_bytes, chave) if STORAGE_BACKEND == "sftp" else _s3_subir(pdf_bytes, chave)
 
 
@@ -459,9 +493,16 @@ def expurgar_antigos(dias: int = 7) -> int:
 # ---------------------------------------------------------------- endpoint
 @app.post("/danfe", response_model=RespostaOk)
 def danfe(req: PedidoRequest, authorization: str = Header(None)):
-    esperado = os.environ.get("BRIDGE_TOKEN")
-    if not esperado or authorization != f"Bearer {esperado}":
-        raise HTTPException(401, "Não autorizado.")
+    checar_token(authorization)
+
+    if not pedido_do_site(req.orderId):
+        # 400: pedido de outra operação (prefixo de letras). Não é erro técnico
+        # nem "nota não emitida" — o agente deve devolver ao manager, que já
+        # tem regra própria para esses pedidos.
+        raise HTTPException(
+            400,
+            "Pedido fora do escopo desta consulta (não é pedido do site).",
+        )
 
     pedido = buscar_pedido_vtex(req.orderId)
     encontrados = extrair_xmls(pedido, req.invoiceNumber)
@@ -488,6 +529,124 @@ def danfe(req: PedidoRequest, authorization: str = Header(None)):
         )
 
     return RespostaOk(orderId=req.orderId, notas=notas)
+
+
+def listar_pedidos_faturados(por_pagina: int = 50) -> List[dict]:
+    """
+    Lista os pedidos faturados mais recentes na VTEX.
+
+    Sem filtro de data na query de propósito: menos sintaxe da API de Orders
+    para errar. O corte por data é feito aqui no código, sobre creationDate.
+    """
+    account = os.environ["VTEX_ACCOUNT"]
+    env = os.environ.get("VTEX_ENVIRONMENT", "vtexcommercestable")
+    resp = requests.get(
+        f"https://{account}.{env}.com.br/api/oms/pvt/orders",
+        params={
+            "f_status": "invoiced",
+            "orderBy": "creationDate,desc",
+            "per_page": por_pagina,
+            "page": 1,
+        },
+        headers={
+            "X-VTEX-API-AppKey": os.environ["VTEX_APP_KEY"],
+            "X-VTEX-API-AppToken": os.environ["VTEX_APP_TOKEN"],
+            "Accept": "application/json",
+        },
+        timeout=TIMEOUT,
+    )
+    if resp.status_code != 200:
+        raise HTTPException(502, f"VTEX retornou {resp.status_code} ao listar pedidos.")
+    return ((resp.json() or {}).get("list")) or []
+
+
+@app.api_route("/pregerar", methods=["GET", "POST"])
+def pregerar(
+    limite: Optional[int] = None,
+    dias: Optional[int] = None,
+    authorization: str = Header(None),
+):
+    """
+    Varredura: gera no storage o DANFE das notas faturadas que ainda não têm PDF.
+
+    Idempotente — o que já existe é apenas contado. Pode rodar quantas vezes
+    quiser; se uma execução falhar, a próxima conserta.
+
+    Chamada por cron (cron-job.org). Serve também de keep-alive: mantém a
+    instância acordada fazendo trabalho útil em vez de bater num /health vazio.
+    """
+    checar_token(authorization)
+
+    limite = PREGERAR_LIMITE if limite is None else max(1, limite)
+    dias = PREGERAR_DIAS if dias is None else max(1, dias)
+    corte = date.today() - timedelta(days=dias)
+
+    resumo = {
+        "geradas": [],
+        "ja_existiam": 0,
+        "sem_nota": 0,
+        "fora_do_escopo": 0,
+        "consultados": 0,
+        "erros": [],
+    }
+
+    # uma conexão FTPS para o lote inteiro, em vez de uma por arquivo
+    conn = _ftps() if STORAGE_BACKEND == "ftps" else None
+    try:
+        for item in listar_pedidos_faturados():
+            if len(resumo["geradas"]) >= limite:
+                break
+
+            order_id = (item.get("orderId") or "").strip()
+            if not order_id or order_id in _PREGERADOS:
+                continue
+
+            criado = (item.get("creationDate") or "")[:10]
+            try:
+                if criado and date.fromisoformat(criado) < corte:
+                    continue
+            except ValueError:
+                pass
+
+            if not pedido_do_site(order_id):
+                resumo["fora_do_escopo"] += 1
+                _PREGERADOS.add(order_id)
+                continue
+
+            resumo["consultados"] += 1
+            try:
+                achados = extrair_xmls(buscar_pedido_vtex(order_id))
+                if not achados:
+                    # nota pode sair depois: não marca como resolvido
+                    resumo["sem_nota"] += 1
+                    continue
+
+                for it in achados:
+                    info = validar_xml(it["xml"])
+                    chave = info["chave"]
+                    if ja_existe(chave, conn):
+                        resumo["ja_existiam"] += 1
+                        continue
+                    subir_pdf(gerar_pdf(it["xml"]), chave, conn)
+                    resumo["geradas"].append(
+                        {"pedido": order_id, "nota": info["numero"], "chave": chave}
+                    )
+
+                _PREGERADOS.add(order_id)
+
+            except HTTPException as e:
+                # um pedido problemático não pode abortar o lote
+                resumo["erros"].append(
+                    {"pedido": order_id, "erro": f"{e.status_code}: {e.detail}"}
+                )
+            except Exception as e:
+                resumo["erros"].append({"pedido": order_id, "erro": type(e).__name__})
+    finally:
+        if conn is not None:
+            _ftps_fechar(conn)
+
+    resumo["memoria"] = len(_PREGERADOS)
+    return resumo
 
 
 @app.get("/health")
