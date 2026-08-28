@@ -97,6 +97,7 @@ class NotaResponse(BaseModel):
     serie: Optional[str]
     chave: str
     pdf_url: str
+    emissao: Optional[str] = None   # dd/mm/aaaa, extraída do XML
 
 
 class RespostaOk(BaseModel):
@@ -187,7 +188,22 @@ def validar_xml(xml_content: str) -> dict:
         "chave": chave,
         "numero": txt("nNF", ide),
         "serie": txt("serie", ide),
+        # dhEmi é o campo atual (datetime ISO); dEmi é o legado (só data)
+        "emissao": formatar_data(txt("dhEmi", ide) or txt("dEmi", ide)),
     }
+
+
+def formatar_data(valor: Optional[str]) -> Optional[str]:
+    """
+    '2026-08-28T15:19:00-03:00' -> '28/08/2026'. Devolve o valor original se
+    não reconhecer o formato: melhor uma data estranha que nenhuma.
+    """
+    if not valor:
+        return None
+    try:
+        return date.fromisoformat(valor[:10]).strftime("%d/%m/%Y")
+    except ValueError:
+        return valor
 
 
 # ---------------------------------------------------------------- PDF
@@ -524,7 +540,11 @@ def danfe(req: PedidoRequest, authorization: str = Header(None)):
             url = subir_pdf(gerar_pdf(item["xml"]), chave)
         notas.append(
             NotaResponse(
-                numero=info["numero"], serie=info["serie"], chave=chave, pdf_url=url
+                numero=info["numero"],
+                serie=info["serie"],
+                chave=chave,
+                pdf_url=url,
+                emissao=info.get("emissao"),
             )
         )
 
