@@ -1,6 +1,10 @@
 # Versões efetivamente testadas na geração dos DANFEs reais da Bisturi.
 # brazilfiscalreport e paramiko estão fixados porque são o núcleo do serviço;
 # se precisar atualizar, gere um PDF de teste antes de subir.
+# ATENÇÃO no brazilfiscalreport: o layout customizado em gerar_pdf() sobrescreve
+# métodos internos da lib (_draw_additional_data, get_font_size) e troca a
+# constante DEFAULT_FIELD_HEIGHT. Subir de versão pode quebrar o visual sem
+# quebrar o serviço — confira um PDF antes.
 fastapi==0.141.1
 uvicorn[standard]
 brazilfiscalreport==1.0.2

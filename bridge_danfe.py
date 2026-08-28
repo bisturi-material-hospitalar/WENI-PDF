@@ -67,6 +67,20 @@ RE_PEDIDO_SITE = re.compile(r"\d+-\d+")
 PREGERAR_LIMITE = int(os.environ.get("PREGERAR_LIMITE", 20))
 PREGERAR_DIAS = int(os.environ.get("PREGERAR_DIAS", 3))
 
+# ---- aparência da DANFE (tudo ajustável por variável de ambiente) ----
+# Raio do canto das caixas, em mm. 0 = cantos retos (padrão da lib).
+DANFE_RAIO_CANTO = float(os.environ.get("DANFE_RAIO_CANTO", 1.2))
+# Multiplicador da fonte de CONTEÚDO dos campos. Rótulos não escalam.
+# 1.35 (o FontSize.BIG da lib) transborda a margem direita; 1.18 é o limite
+# testado em que nada é cortado.
+DANFE_FATOR_FONTE = float(os.environ.get("DANFE_FATOR_FONTE", 1.18))
+# Altura da caixa de cada campo, em mm (padrão da lib: 6).
+DANFE_ALTURA_CAMPO = float(os.environ.get("DANFE_ALTURA_CAMPO", 7.0))
+# Altura do bloco DADOS ADICIONAIS, em mm (padrão da lib: 20).
+# O bloco de produtos ocupa o que sobra da página, então aumentar este
+# diminui aquele — é assim que se encolhe a área de produtos.
+DANFE_ALTURA_ADICIONAIS = float(os.environ.get("DANFE_ALTURA_ADICIONAIS", 55.0))
+
 # orderIds já resolvidos nesta instância. Evita buscar o mesmo pedido na VTEX
 # a cada varredura. Some quando o container reinicia, e isso é inofensivo:
 # a execução seguinte apenas confere de novo.
@@ -230,7 +244,98 @@ def gerar_pdf(xml_content: str) -> bytes:
     if logo and os.path.exists(logo):
         config.logo = logo
 
-    pdf = bytes(Danfe(xml=xml_content, config=config).output())
+    # A altura do campo é lida como constante de módulo pela lib, então
+    # precisa ser trocada nos dois lugares onde ela foi importada.
+    from brazilfiscalreport.danfe import danfe_basic_field, danfe_conf
+    from brazilfiscalreport.danfe.danfe_block import DanfeBlock
+    from brazilfiscalreport.danfe.danfe_conf import (
+        BASE_FONT_SIZES,
+        HEIGHT_FONT_BLOCK_DESC,
+    )
+    from brazilfiscalreport.danfe.models import BaseFieldInfo
+
+    danfe_conf.DEFAULT_FIELD_HEIGHT = DANFE_ALTURA_CAMPO
+    danfe_basic_field.DEFAULT_FIELD_HEIGHT = DANFE_ALTURA_CAMPO
+
+    class DanfeBisturi(Danfe):
+        """
+        Layout customizado. Cada override existe por um motivo específico:
+
+        rect()            canto arredondado em TODOS os campos de uma vez —
+                          toda caixa da DANFE passa por Element.render(),
+                          que chama pdf.rect(). Um ponto, efeito global.
+        get_font_size()   fonte de conteúdo maior sem mexer nos rótulos.
+                          A tabela de produtos fica fora da escala: as
+                          colunas NCM e UN são estreitas e o texto quebraria
+                          dentro da célula.
+        _get_additional…  quebra de linha depois de cada "//" das informações
+                          complementares. O "//" é preservado — nada se
+                          perde do texto original, só ganha organização.
+        _draw_additional… altura do bloco DADOS ADICIONAIS configurável
+                          (a lib fixa 20mm no código).
+
+        Os overrides dependem de nomes internos da brazilfiscalreport, que
+        está fixada em 1.0.2 no requirements.txt. Ao atualizar a lib, gere
+        um PDF de teste antes de subir.
+        """
+
+        SEM_ESCALA_DE_FONTE = {"PRODUCT_DESCRIPTION"}
+
+        def rect(self, x, y, w, h, style=None, round_corners=False, corner_radius=0):
+            if DANFE_RAIO_CANTO <= 0:
+                return super().rect(x, y, w, h, style=style)
+            return super().rect(
+                x, y, w, h,
+                style=style,
+                round_corners=True,
+                corner_radius=DANFE_RAIO_CANTO,
+            )
+
+        def get_font_size(self, element_type: str, multiplier=False):
+            base = BASE_FONT_SIZES.get(element_type)
+            if not multiplier or element_type in self.SEM_ESCALA_DE_FONTE:
+                return base
+            return base * DANFE_FATOR_FONTE
+
+        def _get_additional_data_content(self):
+            texto = super()._get_additional_data_content() or ""
+            return texto.replace("//", "//\n")
+
+        def _draw_additional_data(self, additional_data, continuation_height=None):
+            bloco = DanfeBlock(description="DADOS ADICIONAIS", pdf=self)
+            altura = (
+                continuation_height - HEIGHT_FONT_BLOCK_DESC
+                if continuation_height
+                else DANFE_ALTURA_ADICIONAIS
+            )
+            bloco.rows_heights = (altura,)
+            if not continuation_height:
+                campos = [
+                    BaseFieldInfo(
+                        w=0,
+                        description="INFORMAÇÕES COMPLEMENTARES",
+                        content=additional_data,
+                        type="info_complementares",
+                    ),
+                    BaseFieldInfo(w=70, description="RESERVADO AO FISCO", content=""),
+                ]
+            else:
+                campos = [
+                    BaseFieldInfo(
+                        w=0,
+                        description="CONTINUAÇÃO INFORMAÇÕES COMPLEMENTARES",
+                        content=additional_data,
+                    ),
+                ]
+            bloco.add_fields([campos])
+            bloco.render()
+            campo = bloco.fields[0]
+            return campo.get_content_lines(), campo.get_max_content_lines()
+
+    # preserva os "\n" que injetamos nas informações complementares
+    config.infcpl_semicolon_newline = True
+
+    pdf = bytes(DanfeBisturi(xml=xml_content, config=config).output())
     if not pdf.startswith(b"%PDF"):
         raise HTTPException(500, "Falha ao gerar o PDF.")
     return pdf
