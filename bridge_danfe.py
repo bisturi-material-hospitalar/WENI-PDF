@@ -42,6 +42,7 @@ STATUS DOS TESTES
   NÃO TESTADO ⚠️  chamada real à VTEX e upload real no R2 (precisam credenciais)
 """
 
+import io
 import os
 import re
 import xml.etree.ElementTree as ET
@@ -76,6 +77,14 @@ DANFE_RAIO_CANTO = float(os.environ.get("DANFE_RAIO_CANTO", 1.2))
 DANFE_FATOR_FONTE = float(os.environ.get("DANFE_FATOR_FONTE", 1.18))
 # Altura da caixa de cada campo, em mm (padrão da lib: 6).
 DANFE_ALTURA_CAMPO = float(os.environ.get("DANFE_ALTURA_CAMPO", 7.0))
+# Logo: lado máximo em pixels e nº de cores. Na DANFE a logo ocupa ~30mm,
+# então acima de ~400px não há ganho visual — só peso no PDF, que o cliente
+# baixa no celular. 0 em LOGO_CORES desliga a redução de cores.
+LOGO_MAX_PX = int(os.environ.get("LOGO_MAX_PX", 400))
+LOGO_CORES = int(os.environ.get("LOGO_CORES", 64))
+# Aparar a margem branca em volta da marca. A caixa da logo na DANFE é fixa:
+# margem sobrando dentro da imagem vira marca menor na nota. 0 desliga.
+LOGO_APARAR = int(os.environ.get("LOGO_APARAR", 1))
 # Altura do bloco DADOS ADICIONAIS, em mm (padrão da lib: 20).
 # O bloco de produtos ocupa o que sobra da página, então aumentar este
 # diminui aquele — é assim que se encolhe a área de produtos.
@@ -268,6 +277,65 @@ def formatar_data(valor: Optional[str]) -> Optional[str]:
 
 
 # ---------------------------------------------------------------- PDF
+_LOGO_CACHE: dict = {}
+
+
+def preparar_logo(caminho: str):
+    """
+    Reduz a logo antes de embutir no PDF, e guarda o resultado em memória.
+
+    Sem isso, uma logo grande vira peso em TODA nota: uma imagem de
+    4000x4000 embutida faz cada DANFE passar de 1MB, e é o cliente que
+    baixa isso no celular. Na DANFE a logo ocupa cerca de 30mm — acima de
+    LOGO_MAX_PX não existe ganho visual.
+
+    Falha aqui nunca derruba a geração: qualquer problema devolve o caminho
+    original e o PDF sai com a logo grande. É otimização, não requisito.
+    """
+    chave = (caminho, os.path.getmtime(caminho), LOGO_MAX_PX, LOGO_CORES)
+    if chave in _LOGO_CACHE:
+        return io.BytesIO(_LOGO_CACHE[chave])
+
+    try:
+        from PIL import Image
+
+        im = Image.open(caminho)
+        # achata transparência sobre branco: evita máscara alfa no PDF
+        if im.mode in ("RGBA", "LA", "P"):
+            fundo = Image.new("RGB", im.size, "white")
+            im = im.convert("RGBA")
+            fundo.paste(im, mask=im.split()[-1])
+            im = fundo
+        else:
+            im = im.convert("RGB")
+
+        if LOGO_APARAR:
+            from PIL import ImageChops
+
+            branco = Image.new("RGB", im.size, "white")
+            caixa = ImageChops.difference(im, branco).getbbox()
+            # caixa None = imagem toda branca; ignora nesse caso
+            if caixa and (caixa[2] - caixa[0]) > 1 and (caixa[3] - caixa[1]) > 1:
+                im = im.crop(caixa)
+
+        if max(im.size) > LOGO_MAX_PX:
+            fator = LOGO_MAX_PX / max(im.size)
+            im = im.resize(
+                (max(1, int(im.width * fator)), max(1, int(im.height * fator))),
+                Image.LANCZOS,
+            )
+        if LOGO_CORES > 0:
+            im = im.quantize(colors=LOGO_CORES, method=Image.MEDIANCUT)
+
+        buf = io.BytesIO()
+        im.save(buf, format="PNG", optimize=True)
+        _LOGO_CACHE.clear()          # só a versão corrente interessa
+        _LOGO_CACHE[chave] = buf.getvalue()
+        return io.BytesIO(_LOGO_CACHE[chave])
+    except Exception:
+        return caminho
+
+
 def gerar_pdf(xml_content: str) -> bytes:
     """
     XML -> bytes do PDF. Fonte TIMES de propósito: com COURIER o texto de
@@ -289,7 +357,7 @@ def gerar_pdf(xml_content: str) -> bytes:
     )
     logo = os.environ.get("LOGO_PATH")
     if logo and os.path.exists(logo):
-        config.logo = logo
+        config.logo = preparar_logo(logo)
 
     # A altura do campo é lida como constante de módulo pela lib, então
     # precisa ser trocada nos dois lugares onde ela foi importada.
