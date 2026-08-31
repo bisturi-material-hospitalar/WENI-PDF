@@ -41,47 +41,47 @@ OUTRO_CNPJ = "11222333000181"
 
 LISTA = [
     # 0: bom, recente
-    {"orderId": "1657541006231-01", "invoiceOutput": ["372457"],
+    {"orderId": "1600000000231-01", "invoiceOutput": ["372457"],
      "creationDate": iso(3), "totalValue": 123456},
     # 1: prefixo de letras -> descartado sem abrir
-    {"orderId": "PGM-1657548196767-01", "invoiceOutput": ["372999"],
+    {"orderId": "PGM-1600000000999-01", "invoiceOutput": ["372999"],
      "creationDate": iso(4), "totalValue": 100},
     # 2: sem nota emitida -> descartado sem abrir
-    {"orderId": "1657541006232-01", "invoiceOutput": [],
+    {"orderId": "1600000000232-01", "invoiceOutput": [],
      "creationDate": iso(5), "totalValue": 100},
     # 3: outro CNPJ -> abre e é recusado
-    {"orderId": "1657541006233-01", "invoiceOutput": ["372500"],
+    {"orderId": "1600000000233-01", "invoiceOutput": ["372500"],
      "creationDate": iso(6), "totalValue": 5000},
     # 4: e-mail em claro divergente -> abre e é recusado
-    {"orderId": "1657541006234-01", "invoiceOutput": ["372501"],
+    {"orderId": "1600000000234-01", "invoiceOutput": ["372501"],
      "creationDate": iso(7), "totalValue": 5000},
     # 5: e-mail mascarado pela VTEX, CNPJ bate -> aceito
-    {"orderId": "1657541006235-01", "invoiceOutput": ["372502"],
+    {"orderId": "1600000000235-01", "invoiceOutput": ["372502"],
      "creationDate": iso(8), "totalValue": 89000},
     # 6: CNPJ em corporateDocument -> aceito
-    {"orderId": "1657541006236-01", "invoiceOutput": ["372503"],
+    {"orderId": "1600000000236-01", "invoiceOutput": ["372503"],
      "creationDate": iso(9), "totalValue": 241090},
     # 7: pedido que não abre na VTEX -> ignorado, sem derrubar a busca
-    {"orderId": "1657541006237-01", "invoiceOutput": ["372504"],
+    {"orderId": "1600000000237-01", "invoiceOutput": ["372504"],
      "creationDate": iso(10), "totalValue": 100},
     # 8: duas notas no mesmo pedido -> duas opções
-    {"orderId": "1657541006238-01", "invoiceOutput": ["372505", "372506"],
+    {"orderId": "1600000000238-01", "invoiceOutput": ["372505", "372506"],
      "creationDate": iso(11), "totalValue": 700000},
     # 9: fora da janela -> corta aqui
-    {"orderId": "1657541006239-01", "invoiceOutput": ["300000"],
+    {"orderId": "1600000000239-01", "invoiceOutput": ["300000"],
      "creationDate": iso(400), "totalValue": 100},
     # 10: depois do corte, nunca deve ser visto
-    {"orderId": "1657541006240-01", "invoiceOutput": ["300001"],
+    {"orderId": "1600000000240-01", "invoiceOutput": ["300001"],
      "creationDate": iso(401), "totalValue": 100},
 ]
 
 PERFIS = {
-    "1657541006231-01": {"email": EMAIL, "document": CNPJ},
-    "1657541006233-01": {"email": EMAIL, "document": OUTRO_CNPJ},
-    "1657541006234-01": {"email": "outro@empresa.com.br", "document": CNPJ},
-    "1657541006235-01": {"email": "a1b2c3-d4e5@ct.vtex.com.br", "document": CNPJ},
-    "1657541006236-01": {"email": EMAIL, "document": "", "corporateDocument": CNPJ},
-    "1657541006238-01": {"email": EMAIL, "document": CNPJ},
+    "1600000000231-01": {"email": EMAIL, "document": CNPJ},
+    "1600000000233-01": {"email": EMAIL, "document": OUTRO_CNPJ},
+    "1600000000234-01": {"email": "outro@empresa.com.br", "document": CNPJ},
+    "1600000000235-01": {"email": "a1b2c3-d4e5@ct.vtex.com.br", "document": CNPJ},
+    "1600000000236-01": {"email": EMAIL, "document": "", "corporateDocument": CNPJ},
+    "1600000000238-01": {"email": EMAIL, "document": CNPJ},
 }
 
 ABERTOS = []
@@ -122,14 +122,14 @@ if numeros != esperado:
     falhas.append("números: obtido=%r esperado=%r" % (numeros, esperado))
 
 # nenhum pedido descartado por regra local foi aberto na VTEX
-for nao_deve in ("PGM-1657548196767-01", "1657541006232-01",
-                 "1657541006239-01", "1657541006240-01"):
+for nao_deve in ("PGM-1600000000999-01", "1600000000232-01",
+                 "1600000000239-01", "1600000000240-01"):
     if nao_deve in ABERTOS:
         falhas.append("abriu na VTEX um pedido que devia ser descartado antes: %s"
                       % nao_deve)
 
 # o pedido do outro CNPJ foi aberto (a conferência exige) mas não entrou
-if "1657541006233-01" not in ABERTOS:
+if "1600000000233-01" not in ABERTOS:
     falhas.append("não conferiu o pedido de outro CNPJ")
 if "372500" in numeros:
     falhas.append("VAZOU nota de outro CNPJ")
@@ -142,7 +142,7 @@ if primeira.valor != "R$ 1.234,56":
     falhas.append("valor da primeira opção: %r" % primeira.valor)
 if primeira.data_pedido != (HOJE - timedelta(days=3)).strftime("%d/%m/%Y"):
     falhas.append("data da primeira opção: %r" % primeira.data_pedido)
-if primeira.orderId != "1657541006231-01":
+if primeira.orderId != "1600000000231-01":
     falhas.append("orderId da primeira opção: %r" % primeira.orderId)
 
 # ---- documento que não bate com nada devolve lista vazia ----
@@ -183,3 +183,92 @@ if falhas:
 print("bridge/e-mail: todos os casos passaram")
 print("  notas devolvidas:", numeros)
 print("  pedidos abertos na VTEX:", len(PERFIS) + 1, "de", len(LISTA), "listados")
+
+# ---------------------------------------------------------------------------
+# buscar_pedidos_por_nota: separa nota do site de nota de marketplace.
+# A Bisturi usa uma sequência única de numeração, então os dois casos caem no
+# mesmo intervalo de números e a distinção não pode se perder.
+# ---------------------------------------------------------------------------
+LISTA_NOTA = {
+    # nota 372824 pertence a pedido da Amazon
+    "372824": [
+        {"orderId": "MZN-000-0000000-0000000_DBA", "invoiceOutput": ["372824"]},
+    ],
+    # nota 372820 é do site
+    "372820": [
+        {"orderId": "1600000000000-01", "invoiceOutput": ["372820"]},
+    ],
+    # nota 999999 não existe: a busca livre devolve pedido que não bate
+    "999999": [
+        {"orderId": "1600000000000-01", "invoiceOutput": ["372820"]},
+    ],
+}
+
+
+def get_nota(url, params=None, headers=None, timeout=None):
+    return RespFalsa({"list": LISTA_NOTA.get(str(params.get("q")), [])})
+
+
+b.requests.get = get_nota
+
+do_site, fora = b.buscar_pedidos_por_nota("372824")
+if do_site or fora != ["MZN-000-0000000-0000000_DBA"]:
+    falhas.append("nota de marketplace: do_site=%r fora=%r" % (do_site, fora))
+
+do_site, fora = b.buscar_pedidos_por_nota("372820")
+if do_site != ["1600000000000-01"] or fora:
+    falhas.append("nota do site: do_site=%r fora=%r" % (do_site, fora))
+
+do_site, fora = b.buscar_pedidos_por_nota("999999")
+if do_site or fora:
+    falhas.append("nota inexistente devolveu %r / %r" % (do_site, fora))
+
+# zeros à esquerda não atrapalham
+do_site, fora = b.buscar_pedidos_por_nota("0372820")
+if do_site != ["1600000000000-01"]:
+    falhas.append("zeros à esquerda: %r" % do_site)
+
+if falhas:
+    print("FALHAS (%d):" % len(falhas))
+    for f in falhas:
+        print("  - " + f)
+    raise SystemExit(1)
+print("bridge/nota: separação site vs marketplace ok")
+
+# ---- série e número decodificam das posições certas da chave ----
+#
+# ATENÇÃO: a chave abaixo é SINTÉTICA de propósito, e deve continuar sendo.
+# Nunca coloque uma chave de acesso real aqui.
+#
+# O nome do arquivo no storage É a chave, e a URL base é pública
+# (PUBLIC_BASE_URL). Uma chave real neste arquivo é uma URL de DANFE real
+# montável por qualquer pessoa — e o DANFE traz nome, endereço, CPF e itens
+# comprados do cliente. Como este repositório é público, a chave vazaria
+# junto. Não adianta o PDF estar expurgado: a bridge regenera sob demanda,
+# e a URL volta a existir.
+#
+# A chave é construída no mesmo layout do padrão NF-e, então ela ainda prova
+# o que precisa ser provado: que nnf_da_chave() e serie_da_chave() leem as
+# posições certas. Só o cNF (8 dígitos aleatórios) e o DV são zerados, o que
+# a torna inútil como URL. Que as posições batem com a realidade está
+# registrado em bridge_danfe.py, conferido contra chaves reais fora do repo.
+CHAVES_SINTETICAS = {
+    # 33 | 2601 | CNPJ | 55 | 050 | 000099999 | 1 | 00000000 | 0
+    "33260132561144000103550500000999991000000000": ("50", "99999"),
+}
+for chave, (serie, numero) in CHAVES_SINTETICAS.items():
+    if len(chave) != 44:
+        falhas.append("chave de teste com %d dígitos" % len(chave))
+    if b.serie_da_chave(chave) != serie:
+        falhas.append("série da chave: %r" % b.serie_da_chave(chave))
+    if b.nnf_da_chave(chave) != numero:
+        falhas.append("número da chave: %r" % b.nnf_da_chave(chave))
+    if chave[6:20] != "32561144000103":
+        falhas.append("CNPJ da chave: %r" % chave[6:20])
+
+if falhas:
+    print("FALHAS (%d):" % len(falhas))
+    for f in falhas:
+        print("  - " + f)
+    raise SystemExit(1)
+print("bridge/chave: série 50 e número decodificam certo")

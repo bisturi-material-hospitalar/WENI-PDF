@@ -148,7 +148,7 @@ uma = caso(
         RespostaFalsa(
             200,
             {
-                "orderId": "1657541006231-01",
+                "orderId": "1600000000231-01",
                 "notas": [
                     {
                         "numero": "372457",
@@ -188,19 +188,19 @@ varias = caso(
                 "opcoes": [
                     {
                         "numero": "372457",
-                        "orderId": "1657541006231-01",
+                        "orderId": "1600000000231-01",
                         "data_pedido": "28/08/2026",
                         "valor": "R$ 1.234,56",
                     },
                     {
                         "numero": "372206",
-                        "orderId": "1657391006010-01",
+                        "orderId": "1600000000010-01",
                         "data_pedido": "21/08/2026",
                         "valor": "R$ 890,00",
                     },
                     {
                         "numero": "371006",
-                        "orderId": "1657161005600-01",
+                        "orderId": "1600000000000-01",
                         "data_pedido": "05/08/2026",
                         "valor": "R$ 2.410,90",
                     },
@@ -234,8 +234,8 @@ magra = caso(
             200,
             {
                 "opcoes": [
-                    {"numero": "372457", "orderId": "1657541006231-01"},
-                    {"numero": "372206", "orderId": "1657391006010-01",
+                    {"numero": "372457", "orderId": "1600000000231-01"},
+                    {"numero": "372206", "orderId": "1600000000010-01",
                      "data_pedido": "21/08/2026"},
                 ]
             },
@@ -250,14 +250,14 @@ if "1) Nota 372457\n" not in magra.get("mensagem", ""):
 caso(
     "pedido tem precedência sobre nota e e-mail",
     {
-        "order_id": "1657161005600-01",
+        "order_id": "1600000000000-01",
         "numero_nota": "372457",
         "email": "c@e.com.br",
         "documento": "32561144000103",
     },
     [RespostaFalsa(409, {})],
     espera_motivo="pedido_sem_nota",
-    espera_corpo={"orderId": "1657161005600-01"},
+    espera_corpo={"orderId": "1600000000000-01"},
 )
 
 caso(
@@ -277,9 +277,22 @@ caso(
 )
 
 # ---------------------------------------------------------------- regressões
+# nota de marketplace: o número está certo, a mensagem precisa dizer isso
+mkt = caso(
+    "nota de marketplace: 400 no caminho da nota",
+    {"numero_nota": "372824"},
+    [RespostaFalsa(400, {})],
+    espera_motivo="fora_do_escopo",
+)
+if "está correto" not in mkt.get("mensagem", ""):
+    falhas.append("mensagem de marketplace não afirma que o número está certo: %r"
+                  % mkt.get("mensagem"))
+if "confira" in mkt.get("mensagem", "").lower():
+    falhas.append("mensagem de marketplace ainda manda conferir o número")
+
 caso(
     "pedido com prefixo continua fora_do_escopo",
-    {"order_id": "PGM-1657548196767-01"},
+    {"order_id": "PGM-1600000000999-01"},
     [RespostaFalsa(400, {})],
     espera_motivo="fora_do_escopo",
 )
@@ -293,7 +306,7 @@ caso(
 )
 
 caso(
-    "varias_series continua funcionando",
+    "dois documentos com o mesmo número: escalona, não pergunta série",
     {"numero_nota": "372457"},
     [
         RespostaFalsa(
@@ -308,7 +321,7 @@ caso(
             },
         )
     ],
-    espera_motivo="varias_series",
+    espera_motivo="nota_ambigua",
 )
 
 caso(

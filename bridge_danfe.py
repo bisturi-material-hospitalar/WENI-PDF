@@ -58,7 +58,7 @@ STATUS_AUTORIZADOS = {"100", "150"}
 TIMEOUT = 30
 
 # Pedido do site: só dígitos e o sufixo -NN. Pedido com prefixo de letras
-# (ex.: PGM-1657548196767-01) é de outra operação e não passa por aqui.
+# (ex.: PGM-1600000000000-01) é de outra operação e não passa por aqui.
 # A regra é "não tem letra nenhuma", não "não tem três letras": se amanhã
 # aparecer prefixo de duas ou quatro letras, continua valendo.
 RE_PEDIDO_SITE = re.compile(r"\d+-\d+")
@@ -285,7 +285,7 @@ def buscar_pedido_vtex(order_id: str) -> dict:
     return resp.json()
 
 
-def buscar_pedidos_por_nota(numero: str) -> List[str]:
+def buscar_pedidos_por_nota(numero: str):
     """
     Descobre o pedido a partir do número da nota fiscal.
 
@@ -295,7 +295,17 @@ def buscar_pedidos_por_nota(numero: str) -> List[str]:
     devolver resultado aproximado; sem essa conferência, o risco seria
     entregar a nota de outro cliente.
 
-    Devolve só pedidos do site (sem prefixo de letras).
+    Devolve DOIS grupos: (do_site, fora_do_escopo).
+
+    A separação existe porque a Bisturi emite tudo numa única série e numa
+    única sequência de numeração: notas do site e notas de marketplace
+    (Amazon, Rede, etc.) se intercalam no mesmo intervalo de números, e mais
+    de um terço do total é de marketplace. Se o segundo grupo fosse apenas
+    descartado, o cliente que comprou em marketplace receberia "confira o
+    número" para um número que existe — ele conferiria, digitaria igual, e
+    receberia a mesma resposta. Devolvendo os dois grupos, quem chama sabe a
+    diferença entre "esse número não existe" e "esse número existe mas é de
+    outro canal de venda".
     """
     numero = str(numero).strip().lstrip("0")
     account = os.environ["VTEX_ACCOUNT"]
@@ -313,15 +323,16 @@ def buscar_pedidos_por_nota(numero: str) -> List[str]:
     if resp.status_code != 200:
         raise HTTPException(502, f"VTEX retornou {resp.status_code} ao buscar a nota.")
 
-    achados = []
+    do_site, fora = [], []
     for item in ((resp.json() or {}).get("list")) or []:
         emitidas = [
             str(n).strip().lstrip("0") for n in (item.get("invoiceOutput") or [])
         ]
         order_id = (item.get("orderId") or "").strip()
-        if numero in emitidas and pedido_do_site(order_id):
-            achados.append(order_id)
-    return achados
+        if numero not in emitidas:
+            continue
+        (do_site if pedido_do_site(order_id) else fora).append(order_id)
+    return do_site, fora
 
 
 def buscar_notas_por_email(email: str, documento: str) -> List["OpcaoNota"]:
@@ -1305,7 +1316,17 @@ def danfe(req: PedidoRequest, authorization: str = Header(None)):
 
         # 2b. não publicada: descobre o pedido pela nota e gera na hora.
         # O cliente não precisa saber que existem dois caminhos.
-        pedidos = buscar_pedidos_por_nota(req.invoiceNumber)
+        pedidos, fora_do_escopo = buscar_pedidos_por_nota(req.invoiceNumber)
+        if not pedidos and fora_do_escopo:
+            # A nota EXISTE, mas pertence a pedido de marketplace. Mesmo 400 do
+            # caminho do orderId, para o agente cair na mesma regra: devolver ao
+            # fluxo principal em vez de mandar o cliente conferir um número que
+            # está certo.
+            raise HTTPException(
+                400,
+                "Nota %s pertence ao pedido %s, que não é do site."
+                % (req.invoiceNumber, fora_do_escopo[0]),
+            )
         if not pedidos:
             raise HTTPException(
                 404,
