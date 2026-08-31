@@ -50,9 +50,9 @@ curl https://bridge-danfe.onrender.com/health
 curl -X POST https://bridge-danfe.onrender.com/danfe \
   -H "Authorization: Bearer $BRIDGE_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"orderId":"1656651004736-01"}'
-# -> {"orderId":"...","notas":[{"numero":"70637","serie":"50",
-#     "chave":"3326...8106","pdf_url":"https://arquivos.bisturi.com.br/danfe/...pdf"}]}
+  -d '{"orderId":"1600000000000-01"}'
+# -> {"orderId":"...","notas":[{"numero":"...","serie":"50",
+#     "chave":"...","pdf_url":"https://arquivos.bisturi.com.br/danfe/...pdf"}]}
 ```
 
 Abra a `pdf_url` no navegador. Se o DANFE aparecer, todo o risco técnico

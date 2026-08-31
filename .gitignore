@@ -1,0 +1,47 @@
+# ---------------------------------------------------------------------------
+# Este repositório é PÚBLICO. Tudo que entra aqui fica indexado para sempre,
+# mesmo que seja apagado depois — o blob continua no histórico do Git.
+# ---------------------------------------------------------------------------
+
+# --- credenciais: nunca versionar ---
+# Todo segredo do serviço entra por variável de ambiente. No Render, as
+# variáveis sensíveis estão marcadas com sync:false no render.yaml, então o
+# valor é pedido na interface e não toca o Git. Se você criar um .env local
+# para rodar a bridge na sua máquina, ele fica coberto por estas linhas.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*_rsa
+*_rsa.pub
+id_rsa*
+credentials.json
+secrets.json
+
+# --- notas fiscais geradas ---
+# Um DANFE traz nome, endereço, CPF e itens comprados do cliente. Nenhum PDF
+# de nota pode ser commitado, nem para depurar layout. Se precisar guardar um
+# exemplo, guarde fora do repositório.
+*.pdf
+*.xml
+
+# --- Python ---
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- sistema operacional / editor ---
+Thumbs.db
+desktop.ini
+.DS_Store
+.idea/
+.vscode/
+*.swp
