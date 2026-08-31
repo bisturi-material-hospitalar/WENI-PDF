@@ -85,6 +85,15 @@ LOGO_CORES = int(os.environ.get("LOGO_CORES", 64))
 # Aparar a margem branca em volta da marca. A caixa da logo na DANFE é fixa:
 # margem sobrando dentro da imagem vira marca menor na nota. 0 desliga.
 LOGO_APARAR = int(os.environ.get("LOGO_APARAR", 1))
+
+# Contato do emitente no cabeçalho. Nenhum dos dois existe no XML da NF-e:
+# o fax não é campo do padrão e o e-mail vem do cadastro, não da nota.
+# EMIT_FAX vazio repete o telefone (é o que o ERP faz hoje).
+EMIT_EMAIL = os.environ.get("EMIT_EMAIL", "")
+EMIT_FAX = os.environ.get("EMIT_FAX", "")
+# Cabeçalho no formato do ERP: rótulo "Identificação do Emitente", texto à
+# esquerda, endereço compacto e linhas de contato. 0 volta ao da biblioteca.
+CABECALHO_ERP = int(os.environ.get("CABECALHO_ERP", 1))
 # Altura do bloco DADOS ADICIONAIS, em mm (padrão da lib: 20).
 # O bloco de produtos ocupa o que sobra da página, então aumentar este
 # diminui aquele — é assim que se encolhe a área de produtos.
@@ -336,6 +345,163 @@ def preparar_logo(caminho: str):
         return caminho
 
 
+_CABECALHO_APLICADO = False
+
+
+def aplicar_cabecalho_erp() -> None:
+    """
+    Reescreve a caixa do emitente no formato do ERP da Bisturi.
+
+    A biblioteca desenha essa caixa em duas classes pequenas e isoladas
+    (DanfeEmitInfo e DanfeIdentInfo), instanciadas por nome dentro de
+    _draw_header. Substituindo as classes no módulo, herdamos os 112 linhas
+    de geometria do cabeçalho sem copiá-las — só o conteúdo das duas células
+    é reescrito.
+
+    Diferenças em relação ao padrão da lib:
+      - rótulo "Identificação do Emitente" no topo da caixa
+      - texto alinhado à esquerda, não centralizado
+      - endereço em duas linhas compactas, não cinco centralizadas
+      - linhas de Telefone, Fax e E-mail
+      - número da nota sem zeros à esquerda ("Nº 371006", não "Nº 000.371.006")
+    """
+    global _CABECALHO_APLICADO
+    if _CABECALHO_APLICADO:
+        return
+
+    from brazilfiscalreport.danfe import danfe as _mod
+    from brazilfiscalreport.danfe.danfe_emit_info import DanfeEmitInfo
+    from brazilfiscalreport.danfe.danfe_ident_info import DanfeIdentInfo
+    from brazilfiscalreport.utils import format_phone
+
+    class EmitInfoBisturi(DanfeEmitInfo):
+        def render(self):
+            # a moldura da célula vem do Element; aqui só o conteúdo
+            Element_render = super(DanfeEmitInfo, self).render
+            Element_render()
+
+            pdf = self.pdf
+            emit = getattr(pdf, "emit", None)
+
+            def campo(tag):
+                # extract_text vive no módulo danfe, não em utils
+                return _mod.extract_text(emit, tag) if emit is not None else ""
+
+            fone = format_phone(campo("fone"))
+            fax = EMIT_FAX or fone
+            email = EMIT_EMAIL or campo("email")
+
+            w_logo, h_logo = 30, 18
+            x_texto = self.x + w_logo + 3
+            w_texto = self.w - w_logo - 4
+
+            # rótulo do bloco, centralizado sobre a área de texto
+            pdf.set_font(pdf.default_font, "", 6.5)
+            pdf.set_xy(x=x_texto, y=self.y + 0.8)
+            pdf.cell(w=w_texto, h=3, text="Identificação do Emitente", align="C")
+
+            # logo centralizada verticalmente na caixa
+            if self.logo_image:
+                pdf.image(
+                    name=self.logo_image,
+                    x=self.x + 2,
+                    y=self.y + (self.h - h_logo) / 2,
+                    w=w_logo,
+                    h=h_logo,
+                    keep_aspect_ratio=True,
+                )
+
+            from brazilfiscalreport.utils import format_cep
+
+            linhas = [
+                self.emit,
+                f"{campo('xLgr')} - {campo('nro')} -",
+                f"{campo('xBairro')} - {campo('xMun')} - "
+                f"{campo('UF')} - {format_cep(campo('CEP'))}",
+                "",
+            ]
+            rotulados = [("Telefone:", fone), ("Fax:", fax), ("E-mail:", email)]
+
+            def escrever(x, y, largura, texto, tamanho=7.0):
+                """
+                cell() do fpdf não corta texto: o que não cabe invade a
+                célula vizinha. A razão social é longa, então a fonte
+                encolhe até caber, com piso de 5pt.
+                """
+                while tamanho > 5.0:
+                    pdf.set_font(pdf.default_font, "", tamanho)
+                    if pdf.get_string_width(texto) <= largura:
+                        break
+                    tamanho -= 0.25
+                pdf.set_xy(x=x, y=y)
+                pdf.cell(w=largura, h=3, text=texto, align="L")
+
+            y = self.y + 4.2
+            for linha in linhas:
+                escrever(x_texto, y, w_texto, linha)
+                y += 3
+
+            for rotulo, valor in rotulados:
+                if not valor:
+                    continue
+                pdf.set_font(pdf.default_font, "B", 7)
+                pdf.set_xy(x=x_texto, y=y)
+                pdf.cell(w=13, h=3, text=rotulo, align="L")
+                escrever(x_texto + 13, y, w_texto - 13, str(valor))
+                y += 3
+
+    class IdentInfoBisturi(DanfeIdentInfo):
+        """
+        Igual à da lib, com uma diferença: o número da nota sai puro
+        ("Nº 371006") em vez de preenchido com zeros ("Nº 000.371.006").
+        A lib formata com int(nr_nota):011 e não expõe gancho para isso,
+        então este render é a cópia dela com essa linha alterada.
+        """
+
+        def render(self):
+            super(DanfeIdentInfo, self).render()
+            pdf = self.pdf
+            pdf.set_xy(x=self.x, y=self.y)
+            pdf.set_font(pdf.default_font, "B", 12)
+            pdf.cell(self.w, None, "DANFE", new_x="LEFT", new_y="NEXT", align="C")
+            pdf.set_font(pdf.default_font, "", 7)
+            for txt in ("DOCUMENTO AUXILIAR", "DA NOTA FISCAL", "ELETRÔNICA"):
+                pdf.cell(self.w, None, txt, new_x="LEFT", new_y="NEXT", align="C")
+
+            pdf.set_font(pdf.default_font, "", 8)
+            pos_x = pdf.get_x() + 1
+            pos_y = pdf.get_y() + 1
+            pdf.set_xy(x=pos_x, y=pos_y)
+            pdf.cell(self.w, 3, "0-ENTRADA", new_x="LEFT", new_y="NEXT", align="L")
+            pdf.cell(self.w, 3, "1-SAÍDA", new_x="LEFT", new_y="NEXT", align="L")
+            pos_x2 = pdf.get_x()
+            pos_y2 = pdf.get_y() + 0.5
+
+            pdf.set_font(pdf.default_font, "B", 10)
+            pdf.text_box(
+                text=self.tp_nf, text_align="C", h_line=4,
+                x=pos_x + 25, y=pos_y, w=5, h=5, border=1,
+            )
+
+            pdf.set_font(pdf.default_font, "B", 10)
+            pdf.set_xy(x=pos_x2, y=pos_y2)
+            # >>> a única mudança em relação à lib <<<
+            pdf.cell(
+                self.w, 5, f"Nº {int(self.nr_nota)}",
+                new_x="LEFT", new_y="NEXT", align="L",
+            )
+            pdf.set_font(pdf.default_font, "B", 8)
+            pdf.cell(
+                self.w, None, f"SÉRIE {self.serie_nf}",
+                new_x="LEFT", new_y="NEXT", align="L",
+            )
+            pdf.cell(self.w, None, f"FOLHA {pdf.page_no()}/{{nb}}", align="L")
+
+    _mod.DanfeEmitInfo = EmitInfoBisturi
+    _mod.DanfeIdentInfo = IdentInfoBisturi
+    _CABECALHO_APLICADO = True
+
+
 def gerar_pdf(xml_content: str) -> bytes:
     """
     XML -> bytes do PDF. Fonte TIMES de propósito: com COURIER o texto de
@@ -446,6 +612,9 @@ def gerar_pdf(xml_content: str) -> bytes:
             bloco.render()
             campo = bloco.fields[0]
             return campo.get_content_lines(), campo.get_max_content_lines()
+
+    if CABECALHO_ERP:
+        aplicar_cabecalho_erp()
 
     # preserva os "\n" que injetamos nas informações complementares
     config.infcpl_semicolon_newline = True
