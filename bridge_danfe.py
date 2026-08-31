@@ -101,9 +101,15 @@ app = FastAPI(title="Bridge DANFE", version="1.0")
 
 # ---------------------------------------------------------------- modelos
 class PedidoRequest(BaseModel):
-    orderId: str
-    # opcional: se o cliente citou uma nota específica, filtra por ela
+    # Dois caminhos de consulta:
+    #   orderId      -> busca o pedido na VTEX e gera/recupera o PDF
+    #   invoiceNumber -> localiza a nota já publicada no storage pela chave
+    # Pelo menos um dos dois é obrigatório. Com os dois, orderId manda e o
+    # invoiceNumber só filtra qual nota do pedido.
+    orderId: Optional[str] = None
     invoiceNumber: Optional[str] = None
+    # desempata quando o mesmo número de nota existe em séries/filiais diferentes
+    serie: Optional[str] = None
 
 
 class NotaResponse(BaseModel):
@@ -115,7 +121,9 @@ class NotaResponse(BaseModel):
 
 
 class RespostaOk(BaseModel):
-    orderId: str
+    # None quando a consulta foi por número de nota: a chave não carrega o
+    # número do pedido, então não há como devolvê-lo por esse caminho.
+    orderId: Optional[str] = None
     notas: List[NotaResponse]
 
 
@@ -137,6 +145,45 @@ def buscar_pedido_vtex(order_id: str) -> dict:
     if resp.status_code != 200:
         raise HTTPException(502, f"VTEX retornou {resp.status_code}.")
     return resp.json()
+
+
+def buscar_pedidos_por_nota(numero: str) -> List[str]:
+    """
+    Descobre o pedido a partir do número da nota fiscal.
+
+    A busca livre (?q=) da listagem de pedidos encontra pela nota, e a própria
+    resposta traz `invoiceOutput` com os números emitidos — então a
+    correspondência é confirmada aqui, sem abrir o pedido. Busca livre pode
+    devolver resultado aproximado; sem essa conferência, o risco seria
+    entregar a nota de outro cliente.
+
+    Devolve só pedidos do site (sem prefixo de letras).
+    """
+    numero = str(numero).strip().lstrip("0")
+    account = os.environ["VTEX_ACCOUNT"]
+    env = os.environ.get("VTEX_ENVIRONMENT", "vtexcommercestable")
+    resp = requests.get(
+        f"https://{account}.{env}.com.br/api/oms/pvt/orders",
+        params={"q": numero, "per_page": 15, "page": 1},
+        headers={
+            "X-VTEX-API-AppKey": os.environ["VTEX_APP_KEY"],
+            "X-VTEX-API-AppToken": os.environ["VTEX_APP_TOKEN"],
+            "Accept": "application/json",
+        },
+        timeout=TIMEOUT,
+    )
+    if resp.status_code != 200:
+        raise HTTPException(502, f"VTEX retornou {resp.status_code} ao buscar a nota.")
+
+    achados = []
+    for item in ((resp.json() or {}).get("list")) or []:
+        emitidas = [
+            str(n).strip().lstrip("0") for n in (item.get("invoiceOutput") or [])
+        ]
+        order_id = (item.get("orderId") or "").strip()
+        if numero in emitidas and pedido_do_site(order_id):
+            achados.append(order_id)
+    return achados
 
 
 def extrair_xmls(pedido: dict, invoice_number: Optional[str] = None) -> List[dict]:
@@ -583,6 +630,99 @@ def subir_pdf(pdf_bytes: bytes, chave: str, conn=None) -> str:
     return _sftp_subir(pdf_bytes, chave) if STORAGE_BACKEND == "sftp" else _s3_subir(pdf_bytes, chave)
 
 
+# ---- consulta por número de nota -------------------------------------------
+# A chave de acesso da NF-e tem posições fixas (44 dígitos):
+#   [0:2] cUF | [2:6] AAMM | [6:20] CNPJ | [20:22] modelo
+#   [22:25] série | [25:34] número da nota | [34] tpEmis | [35:43] cNF | [43] DV
+# Como o nome do arquivo no storage É a chave, o número da nota pode ser lido
+# direto do nome — sem nenhuma chamada à VTEX. Conferido contra chaves reais.
+def nnf_da_chave(chave: str) -> str:
+    return chave[25:34].lstrip("0")
+
+
+def serie_da_chave(chave: str) -> str:
+    return chave[22:25].lstrip("0")
+
+
+def _ftps_listar(conn=None) -> List[str]:
+    ftps = conn or _ftps()
+    try:
+        pasta = os.environ.get("SFTP_BASE_DIR", "/public/danfe").rstrip("/")
+        try:
+            _ftps_cd(ftps, pasta)
+        except error_perm:
+            return []
+        return ftps.nlst()
+    finally:
+        if conn is None:
+            _ftps_fechar(ftps)
+
+
+def listar_chaves(conn=None) -> List[str]:
+    """Chaves das notas que já têm PDF publicado."""
+    if STORAGE_BACKEND == "ftps":
+        nomes = _ftps_listar(conn)
+    elif STORAGE_BACKEND == "sftp":
+        sftp, transport = _sftp()
+        try:
+            base = os.environ.get("SFTP_BASE_DIR", "/public/danfe").rstrip("/")
+            nomes = sftp.listdir(base)
+        finally:
+            sftp.close()
+            transport.close()
+    else:
+        resp = _s3().list_objects_v2(
+            Bucket=os.environ["R2_BUCKET"], Prefix="danfe/"
+        )
+        nomes = [o["Key"] for o in resp.get("Contents", [])]
+
+    chaves = []
+    for nome in nomes:
+        base = nome.rsplit("/", 1)[-1]
+        if base.lower().endswith(".pdf"):
+            chave = base[:-4]
+            if re.fullmatch(r"\d{44}", chave):
+                chaves.append(chave)
+    return chaves
+
+
+def gerar_notas_do_pedido(
+    order_id: str, invoice_number: Optional[str] = None, conn=None
+) -> List["NotaResponse"]:
+    """
+    Pedido -> lista de NotaResponse, gerando o PDF só do que ainda não existe.
+    Usado pelos dois caminhos de consulta (por pedido e por número de nota).
+    """
+    encontrados = extrair_xmls(buscar_pedido_vtex(order_id), invoice_number)
+    notas = []
+    for item in encontrados:
+        info = validar_xml(item["xml"])
+        chave = info["chave"]
+        if ja_existe(chave, conn):
+            url = url_publica(chave)   # cache: não regenera o PDF
+        else:
+            url = subir_pdf(gerar_pdf(item["xml"]), chave, conn)
+        notas.append(
+            NotaResponse(
+                numero=info["numero"],
+                serie=info["serie"],
+                chave=chave,
+                pdf_url=url,
+                emissao=info.get("emissao"),
+            )
+        )
+    return notas
+
+
+def buscar_por_numero(numero: str, serie: Optional[str] = None, conn=None) -> List[str]:
+    numero = str(numero).strip().lstrip("0")
+    achadas = [c for c in listar_chaves(conn) if nnf_da_chave(c) == numero]
+    if serie:
+        s = str(serie).strip().lstrip("0")
+        achadas = [c for c in achadas if serie_da_chave(c) == s]
+    return sorted(achadas)
+
+
 def expurgar_antigos(dias: int = 7) -> int:
     """
     Apaga PDFs com mais de `dias` dias. Rode por cron.
@@ -616,6 +756,49 @@ def expurgar_antigos(dias: int = 7) -> int:
 def danfe(req: PedidoRequest, authorization: str = Header(None)):
     checar_token(authorization)
 
+    # ---- caminho 2: cliente informou o número da nota, não o do pedido ----
+    if not req.orderId:
+        if not req.invoiceNumber:
+            raise HTTPException(422, "Informe orderId ou invoiceNumber.")
+
+        # 2a. já publicada? resolve pelo nome do arquivo, sem tocar na VTEX
+        chaves = buscar_por_numero(req.invoiceNumber, req.serie)
+        if chaves:
+            return RespostaOk(
+                orderId=None,
+                notas=[
+                    NotaResponse(
+                        numero=nnf_da_chave(c),
+                        serie=serie_da_chave(c),
+                        chave=c,
+                        pdf_url=url_publica(c),
+                    )
+                    for c in chaves
+                ],
+            )
+
+        # 2b. não publicada: descobre o pedido pela nota e gera na hora.
+        # O cliente não precisa saber que existem dois caminhos.
+        pedidos = buscar_pedidos_por_nota(req.invoiceNumber)
+        if not pedidos:
+            raise HTTPException(
+                404,
+                f"Nota {req.invoiceNumber} não localizada. Confira o número.",
+            )
+
+        notas = []
+        for order_id in pedidos:
+            notas.extend(
+                gerar_notas_do_pedido(order_id, req.invoiceNumber)
+            )
+        if not notas:
+            raise HTTPException(
+                409, "Nota localizada no pedido, mas sem XML disponível ainda."
+            )
+        return RespostaOk(
+            orderId=pedidos[0] if len(pedidos) == 1 else None, notas=notas
+        )
+
     if not pedido_do_site(req.orderId):
         # 400: pedido de outra operação (prefixo de letras). Não é erro técnico
         # nem "nota não emitida" — o agente deve devolver ao manager, que já
@@ -625,32 +808,13 @@ def danfe(req: PedidoRequest, authorization: str = Header(None)):
             "Pedido fora do escopo desta consulta (não é pedido do site).",
         )
 
-    pedido = buscar_pedido_vtex(req.orderId)
-    encontrados = extrair_xmls(pedido, req.invoiceNumber)
+    notas = gerar_notas_do_pedido(req.orderId, req.invoiceNumber)
 
-    if not encontrados:
+    if not notas:
         # 409: pedido existe mas ainda não tem nota com XML. O agente deve
         # responder "sua nota ainda não foi emitida", não "erro".
         raise HTTPException(
             409, "Pedido sem nota fiscal disponível (ainda não emitida)."
-        )
-
-    notas = []
-    for item in encontrados:
-        info = validar_xml(item["xml"])
-        chave = info["chave"]
-        if ja_existe(chave):
-            url = url_publica(chave)   # cache: não regenera o PDF
-        else:
-            url = subir_pdf(gerar_pdf(item["xml"]), chave)
-        notas.append(
-            NotaResponse(
-                numero=info["numero"],
-                serie=info["serie"],
-                chave=chave,
-                pdf_url=url,
-                emissao=info.get("emissao"),
-            )
         )
 
     return RespostaOk(orderId=req.orderId, notas=notas)
