@@ -100,14 +100,43 @@ def caso(rotulo, parametros, respostas, espera_motivo=None, espera_ok=None,
 
 
 # ---------------------------------------------------------------- e-mail
-caso(
-    "e-mail sem documento não chega na bridge",
+# passo 1 do fluxo em duas perguntas: e-mail sozinho devolve a pergunta do
+# CPF/CNPJ, sem tocar na bridge
+p1 = caso(
+    "e-mail sem documento: pede o CPF/CNPJ sem chamar a bridge",
     {"email": "cliente@empresa.com.br"},
     [],
     espera_motivo="falta_documento",
     espera_ok=False,
     espera_chamadas=0,
 )
+if "e-mail" in p1.get("mensagem", "").lower():
+    falhas.append("pergunta do CPF/CNPJ pede o e-mail de novo: %r"
+                  % p1.get("mensagem"))
+
+# passo 2: com os dois, vai para a bridge
+caso(
+    "e-mail + documento: agora consulta",
+    {"email": "cliente@empresa.com.br", "documento": "32561144000103"},
+    [RespostaFalsa(404, {})],
+    espera_motivo="email_nao_encontrado",
+    espera_corpo={"email": "cliente@empresa.com.br",
+                  "documento": "32561144000103"},
+    espera_chamadas=1,
+)
+
+# a oferta inicial não pode anunciar o CPF/CNPJ junto com o e-mail
+oferta = caso(
+    "oferta inicial não expõe o pedido conjunto",
+    {},
+    [],
+    espera_motivo="sem_identificador",
+    espera_chamadas=0,
+)
+msg = oferta.get("mensagem", "").lower()
+for proibido in ("cpf", "cnpj"):
+    if proibido in msg:
+        falhas.append("oferta inicial menciona %s: %r" % (proibido, msg))
 
 caso(
     "e-mail malformado é barrado antes do documento",
@@ -148,7 +177,7 @@ uma = caso(
         RespostaFalsa(
             200,
             {
-                "orderId": "1600000000231-01",
+                "orderId": "1657541006231-01",
                 "notas": [
                     {
                         "numero": "372457",
@@ -188,19 +217,19 @@ varias = caso(
                 "opcoes": [
                     {
                         "numero": "372457",
-                        "orderId": "1600000000231-01",
+                        "orderId": "1657541006231-01",
                         "data_pedido": "28/08/2026",
                         "valor": "R$ 1.234,56",
                     },
                     {
                         "numero": "372206",
-                        "orderId": "1600000000010-01",
+                        "orderId": "1657391006010-01",
                         "data_pedido": "21/08/2026",
                         "valor": "R$ 890,00",
                     },
                     {
                         "numero": "371006",
-                        "orderId": "1600000000000-01",
+                        "orderId": "1657161005600-01",
                         "data_pedido": "05/08/2026",
                         "valor": "R$ 2.410,90",
                     },
@@ -234,8 +263,8 @@ magra = caso(
             200,
             {
                 "opcoes": [
-                    {"numero": "372457", "orderId": "1600000000231-01"},
-                    {"numero": "372206", "orderId": "1600000000010-01",
+                    {"numero": "372457", "orderId": "1657541006231-01"},
+                    {"numero": "372206", "orderId": "1657391006010-01",
                      "data_pedido": "21/08/2026"},
                 ]
             },
@@ -250,14 +279,14 @@ if "1) Nota 372457\n" not in magra.get("mensagem", ""):
 caso(
     "pedido tem precedência sobre nota e e-mail",
     {
-        "order_id": "1600000000000-01",
+        "order_id": "1657161005600-01",
         "numero_nota": "372457",
         "email": "c@e.com.br",
         "documento": "32561144000103",
     },
     [RespostaFalsa(409, {})],
     espera_motivo="pedido_sem_nota",
-    espera_corpo={"orderId": "1600000000000-01"},
+    espera_corpo={"orderId": "1657161005600-01"},
 )
 
 caso(
@@ -266,14 +295,6 @@ caso(
     [RespostaFalsa(404, {})],
     espera_motivo="nota_nao_encontrada",
     espera_corpo={"invoiceNumber": "372457"},
-)
-
-caso(
-    "nada informado: oferece os três caminhos",
-    {},
-    [],
-    espera_motivo="sem_identificador",
-    espera_chamadas=0,
 )
 
 # ---------------------------------------------------------------- regressões
@@ -292,7 +313,7 @@ if "confira" in mkt.get("mensagem", "").lower():
 
 caso(
     "pedido com prefixo continua fora_do_escopo",
-    {"order_id": "PGM-1600000000999-01"},
+    {"order_id": "PGM-1657548196767-01"},
     [RespostaFalsa(400, {})],
     espera_motivo="fora_do_escopo",
 )
