@@ -55,6 +55,7 @@ STATUS DOS TESTES
 import io
 import os
 import re
+import time
 import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
@@ -79,6 +80,9 @@ RE_PEDIDO_SITE = re.compile(r"\d+-\d+")
 # para trás considerar na listagem.
 PREGERAR_LIMITE = int(os.environ.get("PREGERAR_LIMITE", 20))
 PREGERAR_DIAS = int(os.environ.get("PREGERAR_DIAS", 3))
+# Orcamento de tempo da varredura, em segundos. Abaixo do teto do cron-job.org (30 s) de
+# proposito: melhor devolver resumo parcial em 20 s do que ser cortado sem resposta.
+PREGERAR_SEGUNDOS = int(os.environ.get("PREGERAR_SEGUNDOS", 20))
 
 # ---- aparência da DANFE (tudo ajustável por variável de ambiente) ----
 # Raio do canto das caixas, em mm. 0 = cantos retos (padrão da lib).
@@ -1437,6 +1441,7 @@ def listar_pedidos_faturados(por_pagina: int = 50) -> List[dict]:
 def pregerar(
     limite: Optional[int] = None,
     dias: Optional[int] = None,
+    segundos: Optional[int] = None,
     authorization: str = Header(None),
 ):
     """
@@ -1447,12 +1452,21 @@ def pregerar(
 
     Chamada por cron (cron-job.org). Serve também de keep-alive: mantém a
     instância acordada fazendo trabalho útil em vez de bater num /health vazio.
+
+    **Orçamento de tempo** (`segundos`, default PREGERAR_SEGUNDOS = 20): a varredura
+    para quando o tempo acaba e devolve o que conseguiu, em vez de tentar o lote
+    inteiro. Medido em 03/09/2026: com o upload finalmente funcionando, `limite=5`
+    passou dos 30 s e o cron-job.org cortou com "Failed (timeout)" — e um lote cortado
+    no meio pela rede nem devolve o resumo, então nao se sabe o que foi feito.
+    Sendo idempotente, parar cedo nao perde nada: a proxima execucao continua.
     """
     checar_token(authorization)
 
     limite = PREGERAR_LIMITE if limite is None else max(1, limite)
     dias = PREGERAR_DIAS if dias is None else max(1, dias)
+    orcamento = PREGERAR_SEGUNDOS if segundos is None else max(5, segundos)
     corte = date.today() - timedelta(days=dias)
+    comeco = time.monotonic()
 
     resumo = {
         "geradas": [],
@@ -1461,6 +1475,7 @@ def pregerar(
         "fora_do_escopo": 0,
         "consultados": 0,
         "erros": [],
+        "tempo_esgotado": False,
     }
 
     # uma conexão FTPS para o lote inteiro, em vez de uma por arquivo
@@ -1468,6 +1483,11 @@ def pregerar(
     try:
         for item in listar_pedidos_faturados():
             if len(resumo["geradas"]) >= limite:
+                break
+            # Checa o orcamento ANTES de comecar mais um pedido: parar entre pedidos
+            # deixa o resumo coerente, parar no meio de um upload deixaria .part na pasta.
+            if time.monotonic() - comeco > orcamento:
+                resumo["tempo_esgotado"] = True
                 break
 
             order_id = (item.get("orderId") or "").strip()
@@ -1519,6 +1539,7 @@ def pregerar(
             _ftps_fechar(conn)
 
     resumo["memoria"] = len(_PREGERADOS)
+    resumo["segundos"] = round(time.monotonic() - comeco, 1)
     return resumo
 
 
