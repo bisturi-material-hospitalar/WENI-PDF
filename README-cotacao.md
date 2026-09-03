@@ -113,35 +113,42 @@ Dashboard → `bridge-danfe` → **Environment** → *Add Environment Variable*
 | `COTACAO_VALIDADE_HORAS` | `24` |
 | `COTACAO_STORAGE` | **nao criar por enquanto.** Só se o diagnóstico apontar o transporte — ver abaixo |
 
-### Transporte: o que e fato e o que era hipotese minha (03/09/2026)
+### Transporte: FTPS, medido e confirmado (03/09/2026)
 
-**Fato, verificado no painel da Umbler:** os recursos oferecidos sao FTPS (porta 21),
-Git Remote, Git via SSH ("execute comandos `git`") e o gerenciador web. Nao ha shell.
+**Resolvido.** O transporte e **FTPS na porta 21**. Medido de dentro do Render pela rota
+`/cotacao-diagnostico`, nao inferido:
 
-**Hipotese minha, retratada:** concluir dai que "SFTP nao existe e nunca funcionou" foi
-erro meu. O DANFE grava nota usando o mesmo host, usuario e senha com
-`STORAGE_BACKEND=sftp`; se ele funciona, SFTP funciona. Os indicios que eu usei eram
-circunstanciais: os defaults divergentes dentro do `bridge_danfe.py`, a ausencia de chave
-de setembro na pasta, e o `/expurgo` que pendurou. Nenhum deles mede o transporte.
+| Porta | Transporte | Resultado | O que prova |
+|---|---|---|---|
+| 22 | SFTP | `TimeoutError` / `[Errno 110]` | o TCP nao conecta |
+| 21 | FTPS | `220---- Welcome to Umbler's FTPS!` | conecta, autentica, lista e escreve |
 
-**Consequencia de desenho:** `STORAGE_BACKEND` governa o DANFE, que esta em producao.
-Trocar essa variavel para investigar defeito da cotacao seria arriscar o que funciona
-para consertar o que nao funciona. Por isso a cotacao tem variavel propria:
+O 530 que aparecia antes na porta 21 era credencial: a dupla mostrada no painel ao lado da
+URL do site e de **hospedagem de teste**, nao conta de FTP. Conta de FTP se cria em
+Configuracoes -> FTPS, e e essa que vai em `SFTP_USER` / `SFTP_PASSWORD`.
 
-| Variavel | Efeito |
-|---|---|
-| (nenhuma) | a cotacao segue o `STORAGE_BACKEND` do servico |
-| `COTACAO_STORAGE=ftps` | **so a cotacao** usa FTPS; o DANFE continua no que estava |
-| `COTACAO_STORAGE=sftp` | forca SFTP so na cotacao |
+Consequencia que passou do escopo da cotacao: com `sftp` configurado, **a rota `/danfe`
+estava estourando 500 em producao** e o `/pregerar` devolvia 502. Ficou semanas invisivel
+porque o `/pregerar` captura excecao por pedido e devolve 200, e porque o `paramiko` sem
+prazo demora ~2 min para falhar — tempo em que o proxy do Render desiste e o log so
+registra 502. Detalhado em
+`claude/incidente-2026-09-03-danfe-fora-do-ar-porta-22-inacessivel-do-render.md`.
 
-O FTPS fica implementado e testado (`testes/teste_cotacao_storage.py`, 22 assercoes com
-servidor falso), disponivel quando for preciso, e **nao** entra como default.
+**Duas retratacoes minhas, registradas.** Primeiro afirmei que "SFTP nunca funcionou" a
+partir de indicios circunstanciais — hipotese vendida como fato. Depois voltei atras ao
+ouvir "mas funciona para o DANFE", e essa retratacao tambem estava errada. Nenhuma das
+duas vinha de medicao; a rota de diagnostico resolveu em uma chamada o que tres rodadas de
+palpite nao resolveram.
+
+O modulo da cotacao implementa os dois transportes atras da mesma interface (`subir`,
+`procurar`, `apagar_antigos`). `COTACAO_STORAGE` existe para forcar um transporte so na
+cotacao, sem tocar no DANFE — util em investigacao, sem uso no dia a dia.
 
 Duas coisas que o FTP exige e o SFTP nao: a data de modificacao vem do fato `modify` do
 MLSD, em UTC, com fallback para `NLST` + `MDTM`; e a sessao TLS precisa ser reaproveitada
 no canal de dados (`_FTPSReuse`, copiado do `bridge_danfe.py`).
 
-### Dois nomes errados no dashboard (03/09/2026)### Dois nomes errados no dashboard (03/09/2026)
+### Dois nomes errados no dashboard (03/09/2026)
 
 Na lista de variáveis do `bridge-danfe` estão gravadas:
 

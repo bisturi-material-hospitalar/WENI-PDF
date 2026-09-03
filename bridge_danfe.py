@@ -902,11 +902,26 @@ from ftplib import FTP, FTP_TLS, error_perm
 
 
 def _sftp():
+    """Conecta no SFTP COM PRAZO.
+
+    Sem prazo, `paramiko.Transport((host, porta))` espera o timeout do sistema
+    operacional — uns dois minutos — antes de devolver `[Errno 110] Connection timed
+    out`. Nesse tempo o proxy do Render desiste e o cliente recebe 502 ou "conexao
+    fechada", sem nenhum erro util. Medido em 03/09/2026: /danfe estourando aqui,
+    /pregerar devolvendo 502 e /expurgo pendurado, todos pela mesma causa.
+
+    Com prazo, a falha aparece em segundos e diz o que e. SFTP_TIMEOUT ajusta.
+    """
+    import socket
+
     import paramiko
 
-    transport = paramiko.Transport(
-        (os.environ["SFTP_HOST"], int(os.environ.get("SFTP_PORT", 22)))
-    )
+    prazo = float(os.environ.get("SFTP_TIMEOUT", 15))
+    endereco = (os.environ["SFTP_HOST"], int(os.environ.get("SFTP_PORT", 22)))
+    sock = socket.create_connection(endereco, timeout=prazo)
+    transport = paramiko.Transport(sock)
+    transport.banner_timeout = prazo
+    transport.auth_timeout = prazo
     key_path = os.environ.get("SFTP_KEY_PATH")
     if key_path:
         pkey = paramiko.RSAKey.from_private_key_file(key_path)

@@ -16,14 +16,21 @@ services:
       - key: PYTHON_VERSION
         value: "3.12"
       # --- fixos, podem ficar no arquivo ---
-      # Transporte do DANFE. NAO mexer para investigar defeito da cotacao: o DANFE esta
-      # em producao com este valor. A cotacao tem variavel propria (COTACAO_STORAGE) e
-      # pode ser testada em ftps sem tocar aqui.
+      # MEDIDO em 03/09/2026, de dentro do Render: porta 22 (SFTP) nao conecta
+      # ([Errno 110]); porta 21 (FTPS) conecta e autentica. A Umbler oferece FTPS e SSH
+      # apenas para git. Com `sftp` aqui, /danfe estourava 500 e /pregerar devolvia 502 —
+      # calado, porque o /pregerar captura excecao por pedido e devolve 200.
+      # As credenciais tem de ser de uma CONTA DE FTP criada no painel (Configuracoes ->
+      # FTPS); a dupla mostrada ao lado da URL do site e credencial de hospedagem de
+      # teste e devolve "530 Login authentication failed".
       - key: STORAGE_BACKEND
-        value: sftp
-      # Porta do FTPS, usada pelos dois modulos quando o transporte e ftps.
+        value: ftps
       - key: FTPS_PORT
         value: "21"
+      # Prazo de conexao. Sem ele, paramiko espera o timeout do sistema (~2 min) e o
+      # proxy do Render devolve 502 antes, sem erro util no log.
+      - key: SFTP_TIMEOUT
+        value: "15"
       - key: SFTP_HOST
         value: arquivos-bisturi-com-br.umbler.net
       - key: SFTP_PORT
