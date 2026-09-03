@@ -14,9 +14,15 @@ chama esta bridge com o orderId da VTEX, e recebe de volta a URL do PDF.
                                               |-- sobe no storage
                         <--{pdf_url}--------  |
 
-NÃO usa WinThor. O XML autorizado vem do próprio pedido da VTEX, no campo
-packageAttachment.packages[].embeddedInvoice — confirmado com pedido real.
-Isso dispensa VPN, exposição do ERP e credenciais do WinThor.
+Duas fontes de XML, escolhidas pelo formato do número do pedido:
+
+    pedido do site (1657161005600-01) -> VTEX, campo
+        packageAttachment.packages[].embeddedInvoice
+    pedido do ERP  (257000098)        -> WinThor, endpoint
+        winthor/fiscal/v1/documentosfiscais/nfe/invoiceDocument
+
+A fonte WinThor fica em winthor_danfe.py. Tudo o que vem depois do XML —
+validação, geração do PDF, publicação e busca no acervo — é comum às duas.
 
 Rodar:
     pip install fastapi uvicorn brazilfiscalreport paramiko  # boto3 se usar s3
@@ -35,6 +41,10 @@ Variáveis de ambiente (nada de credencial no código):
                  SFTP_BASE_DIR, PUBLIC_BASE_URL
     -- se s3:    R2_ACCOUNT_ID, R2_BUCKET, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY,
                  URL_EXPIRA_SEGUNDOS (default 604800 = 7 dias)
+    WINTHOR_URL           base da API do WinThor (sem barra no fim)
+    WINTHOR_LOGIN         usuário da API
+    WINTHOR_SENHA_MD5     senha em MD5, como a API exige
+    WINTHOR_BRANCH_ID     filiais separadas por vírgula (ex.: 1,2,3)
 
 STATUS DOS TESTES
   TESTADO ✅  extração do embeddedInvoice, validação, geração do PDF e o
@@ -52,6 +62,8 @@ from typing import List, Optional
 import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
+
+from winthor_danfe import extrair_xmls_winthor, pedido_do_winthor
 
 NS = {"nfe": "http://www.portalfiscal.inf.br/nfe"}
 STATUS_AUTORIZADOS = {"100", "150"}
@@ -1166,8 +1178,15 @@ def gerar_notas_do_pedido(
     """
     Pedido -> lista de NotaResponse, gerando o PDF só do que ainda não existe.
     Usado pelos dois caminhos de consulta (por pedido e por número de nota).
+
+    A origem do XML sai do formato do número: pedido do site tem hífen e vem da
+    VTEX; pedido do ERP é só dígitos e vem do WinThor. Daqui para baixo o
+    tratamento é idêntico, então nota do ERP sai no mesmo formato de entrega.
     """
-    encontrados = extrair_xmls(buscar_pedido_vtex(order_id), invoice_number)
+    if pedido_do_winthor(order_id):
+        encontrados = extrair_xmls_winthor(order_id, invoice_number)
+    else:
+        encontrados = extrair_xmls(buscar_pedido_vtex(order_id), invoice_number)
     notas = []
     for item in encontrados:
         info = validar_xml(item["xml"])
@@ -1346,10 +1365,13 @@ def danfe(req: PedidoRequest, authorization: str = Header(None)):
             orderId=pedidos[0] if len(pedidos) == 1 else None, notas=notas
         )
 
-    if not pedido_do_site(req.orderId):
-        # 400: pedido de outra operação (prefixo de letras). Não é erro técnico
-        # nem "nota não emitida" — o agente deve devolver ao manager, que já
-        # tem regra própria para esses pedidos.
+    if not pedido_do_site(req.orderId) and not pedido_do_winthor(req.orderId):
+        # 400: pedido de outra operação (prefixo de letras: marketplace, PGM).
+        # Não é erro técnico nem "nota não emitida" — o agente deve devolver ao
+        # manager, que já tem regra própria para esses pedidos.
+        #
+        # Pedido do ERP (só dígitos) NÃO cai mais aqui: tem fonte própria de
+        # XML no WinThor e segue pelo gerar_notas_do_pedido.
         raise HTTPException(
             400,
             "Pedido fora do escopo desta consulta (não é pedido do site).",
