@@ -1510,3 +1510,27 @@ def pregerar(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/expurgo")
+def expurgo(dias: int = 7, authorization: str = Header(None)):
+    """Apaga DANFEs com mais de `dias` dias. Feito para ser chamado por cron.
+
+    O README lista "expurgar_antigos(7) por cron, diario" como a mitigacao 3 do risco de
+    link permanente, com status "agendar" — mas nao havia rota nenhuma que chegasse na
+    funcao. As rotas eram /danfe, /pregerar e /health. Ou seja: a mitigacao nao estava
+    apenas nao agendada, estava inalcancavel. Achado e corrigido em 03/09/2026.
+
+    Nada muda por si: sem alguem chamar esta rota, o comportamento e o de antes.
+    """
+    checar_token(authorization)
+    return {"apagados": expurgar_antigos(dias), "dias": dias}
+
+
+# ---------------------------------------------------------------- cotacao em PDF
+# Rotas POST /cotacao e GET /cotacao/{numero}, em modulo proprio (cotacao_api.py) para
+# nao mexer nas funcoes de storage deste arquivo, que estao em producao servindo DANFE.
+# O modulo grava em outra pasta (COTACAO_BASE_DIR) e nao importa nada daqui.
+from cotacao_api import router as cotacao_router  # noqa: E402
+
+app.include_router(cotacao_router)

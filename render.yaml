@@ -24,12 +24,24 @@ services:
         value: "22"
       - key: SFTP_USER
         value: umbler
+      # CORRECAO 03/09/2026: as DANFEs estao em /public/danfe no servidor da Umbler,
+      # nao em /public_html/danfe. O valor errado aqui nao quebrou nada porque o
+      # dashboard do Render tem o certo (o Blueprint so aplica na criacao), mas um
+      # re-sync do Blueprint sobrescreveria e derrubaria DANFE e cotacao juntos.
       - key: SFTP_BASE_DIR
-        value: /public_html/danfe
+        value: /public/danfe
       - key: PUBLIC_BASE_URL
         value: https://arquivos.bisturi.com.br/danfe
       - key: VTEX_ENVIRONMENT
         value: vtexcommercestable
+      # --- cotacao em PDF (pasta e URL proprias, separadas do DANFE) ---
+      - key: COTACAO_BASE_DIR
+        value: /public/cotacao
+      - key: COTACAO_PUBLIC_BASE_URL
+        value: https://arquivos.bisturi.com.br/cotacao
+      # Casa com o "Cotacao valida por 24 horas" impresso no documento.
+      - key: COTACAO_VALIDADE_HORAS
+        value: "24"
       # --- segredos: preencher na interface do Render ---
       - key: BRIDGE_TOKEN
         sync: false

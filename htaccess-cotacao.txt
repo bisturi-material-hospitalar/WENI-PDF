@@ -1,0 +1,19 @@
+# Salve este conteudo como .htaccess dentro da pasta /public/cotacao
+# no servidor da Umbler. OBRIGATORIO, pelo mesmo motivo da pasta do DANFE.
+#
+# Sem isso, qualquer pessoa abre https://arquivos.bisturi.com.br/cotacao/ e ve a
+# LISTA de todos os PDFs — e ai o token aleatorio no nome do arquivo nao protege
+# nada. A cotacao com cadastro completo carrega nome, endereco, CPF e IE.
+
+Options -Indexes
+
+# Impede que o navegador/proxy guarde copia em cache por muito tempo
+<FilesMatch "\.pdf$">
+    Header set Cache-Control "private, max-age=3600"
+</FilesMatch>
+
+# Arquivo parcial nunca deve ser servido: o upload grava como .part e depois
+# renomeia, mas se um upload morrer no meio o .part fica na pasta.
+<FilesMatch "\.part$">
+    Require all denied
+</FilesMatch>

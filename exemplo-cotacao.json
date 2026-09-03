@@ -1,0 +1,50 @@
+{
+  "numero": "WA-9217",
+  "cliente": "CLINICA DE TESTE LTDA",
+  "telefone": "21999990000",
+  "codigo_cliente": "999999",
+  "endereco": "RUA DE TESTE",
+  "numero_endereco": "56",
+  "bairro": "CENTRO",
+  "complemento": "SALA 2",
+  "cidade": "RIO DE JANEIRO",
+  "uf": "RJ",
+  "cep": "20000000",
+  "cpf_cnpj": "00.000.000/0001-00",
+  "ie": "ISENTO",
+  "itens": [
+    {
+      "codigo": "19561",
+      "descricao": "AGULHA PEN INSULINA 04MM WILTEX",
+      "quantidade": 100,
+      "unitario": 0.40,
+      "disponivel": 100
+    },
+    {
+      "codigo": "14846",
+      "descricao": "LUVA PROCEDIMENTOS POWDER FREE SEM PO TAM P - 100 UN",
+      "quantidade": 10,
+      "unitario": 49.90,
+      "disponivel": 1
+    },
+    {
+      "codigo": "20118",
+      "descricao": "ATADURA DE CREPOM 15CM X 1,80M",
+      "quantidade": 40,
+      "unitario": 1.50,
+      "disponivel": 40
+    }
+  ],
+  "pendentes": [
+    {
+      "descricao": "luva cirurgica 9.0",
+      "quantidade": 12,
+      "motivo": "voce pediu 9.0 e o que temos e 7.0 ou 8.5",
+      "alternativas": [
+        { "descricao": "LUVA CIRURGICA DE LATEX MEDIX - SEM PO - 8.5 - PAR", "unitario": 2.90 },
+        { "descricao": "LUVA CIRURGICA LIFEULTRA POWDERFREE ESTERIL SEM PO - 7.0", "unitario": 2.90 }
+      ]
+    }
+  ],
+  "nao_localizados": ["tomografo portatil xyz"]
+}

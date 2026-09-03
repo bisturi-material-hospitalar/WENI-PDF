@@ -38,6 +38,11 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# --- sondas locais do teste de pasta ---
+# ping-public.txt e ping-publichtml.txt servem para descobrir qual pasta da Umbler e
+# servida. Sao descartaveis e nao pertencem ao repositorio.
+ping-*.txt
+
 # --- sistema operacional / editor ---
 Thumbs.db
 desktop.ini
