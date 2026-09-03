@@ -312,6 +312,126 @@ def buscar_cotacao(numero: str, authorization: str = Header(None)):
     )
 
 
+@router.get("/cotacao-diagnostico")
+def diagnostico(authorization: str = Header(None)):
+    """Roda cada etapa do fluxo em separado e diz qual falha.
+
+    Existe porque o 500 do POST /cotacao nao distingue renderizacao de SFTP, e o log do
+    Render e desconfortavel de ler quando o traceback vem quebrado em varias entradas.
+    Nao devolve senha nem token — so tipo e mensagem do erro.
+
+    Caminho proprio (`/cotacao-diagnostico`, com hifen) para nao competir com
+    `/cotacao/{numero}`: "diagnostico" casaria no padrao de numero.
+    """
+    checar_token(authorization)
+
+    etapas = []
+
+    def etapa(nome, funcao):
+        try:
+            etapas.append({"etapa": nome, "ok": True, "detalhe": funcao()})
+        except Exception as exc:  # noqa: BLE001 - o objetivo e justamente reportar
+            etapas.append(
+                {"etapa": nome, "ok": False, "detalhe": f"{type(exc).__name__}: {exc}"}
+            )
+
+    def ambiente():
+        import platform
+        import reportlab
+
+        try:
+            import PIL
+
+            pillow = getattr(PIL, "__version__", "presente")
+        except Exception:
+            # reportlab depende do Pillow para ler PNG. Sem ele, o cabecalho com o
+            # logotipo falha em tempo de renderizacao e o import continua passando.
+            pillow = "AUSENTE"
+        return {
+            "python": platform.python_version(),
+            "reportlab": reportlab.Version,
+            "pillow": pillow,
+            "base_dir": BASE_DIR,
+            "public_base_url": PUBLIC_BASE_URL,
+            "validade_horas": VALIDADE_HORAS,
+        }
+
+    def logo():
+        from reportlab.lib.utils import ImageReader
+
+        from cotacao_pdf import LOGO_ARQUIVO
+
+        return {
+            "caminho": LOGO_ARQUIVO,
+            "existe": os.path.isfile(LOGO_ARQUIVO),
+            "bytes": os.path.getsize(LOGO_ARQUIVO) if os.path.isfile(LOGO_ARQUIVO) else 0,
+            "dimensao": ImageReader(LOGO_ARQUIVO).getSize(),
+        }
+
+    def render():
+        pdf = gerar_pdf(
+            {
+                "cliente": "DIAGNOSTICO",
+                "telefone": "",
+                "protocolo": "DIAG-0000",
+                "data": f"{agora():%d/%m/%Y}",
+                "hora": f"{agora():%H:%M:%S}",
+                "atendimento": "diagnostico",
+                "itens": [{"codigo": "0", "descricao": "ITEM DE TESTE",
+                           "quantidade": 1, "unitario": 1.0, "disponivel": 1}],
+                "pendentes": [],
+                "nao_localizados": [],
+                "total_pedido": 1.0,
+                "total_disponivel": 1.0,
+            }
+        )
+        return {"bytes": len(pdf), "assinatura": pdf[:4].decode("latin-1")}
+
+    def conexao():
+        sftp, transport = _sftp()
+        try:
+            return {"conectado": True, "servidor": transport.getpeername()[0]}
+        finally:
+            sftp.close()
+            transport.close()
+
+    def listagem():
+        sftp, transport = _sftp()
+        try:
+            nomes = sftp.listdir(BASE_DIR)
+            return {"pasta": BASE_DIR, "arquivos": len(nomes)}
+        finally:
+            sftp.close()
+            transport.close()
+
+    def escrita():
+        nome = f"diagnostico-{secrets.token_urlsafe(8)}.txt"
+        sftp, transport = _sftp()
+        try:
+            caminho = f"{BASE_DIR}/{nome}"
+            with sftp.file(caminho, "wb") as arquivo:
+                arquivo.write(b"diagnostico\n")
+            existe = bool(sftp.stat(caminho))
+            sftp.remove(caminho)
+            return {"gravou_e_apagou": existe, "nome": nome}
+        finally:
+            sftp.close()
+            transport.close()
+
+    for nome, funcao in (
+        ("ambiente", ambiente),
+        ("logo", logo),
+        ("renderizacao", render),
+        ("sftp_conexao", conexao),
+        ("sftp_listagem", listagem),
+        ("sftp_escrita", escrita),
+    ):
+        etapa(nome, funcao)
+
+    falhas = [e["etapa"] for e in etapas if not e["ok"]]
+    return {"ok": not falhas, "falhas": falhas, "etapas": etapas}
+
+
 @router.post("/cotacao/expurgo")
 def expurgar_cotacoes(dias: int = 30, authorization: str = Header(None)):
     """Apaga PDFs de cotacao com mais de `dias` dias.

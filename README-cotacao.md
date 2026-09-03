@@ -215,6 +215,25 @@ O que cada resposta tem de dizer:
 Repetir o passo 2 dentro das 24 h tem de devolver `reaproveitado: True` e a mesma URL.
 Para forçar um arquivo novo, acrescente `"regerar": true` ao JSON.
 
+### Quando o POST devolve 500
+
+O 500 nao diz se falhou a renderizacao ou o SFTP, e o traceback no log do Render chega
+quebrado em varias entradas. Para isso existe uma rota que roda cada etapa em separado:
+
+```powershell
+Invoke-RestMethod "$base/cotacao-diagnostico" -Headers $h | ConvertTo-Json -Depth 4
+```
+
+Ela reporta, uma por uma: ambiente (Python, reportlab, **Pillow** — sem ele o reportlab
+nao le PNG e o cabecalho com o logotipo estoura em tempo de renderizacao), o arquivo do
+logotipo, uma renderizacao minima, conexao SFTP, listagem da pasta e um teste de escrita
+que grava e apaga um arquivo. O campo `falhas` lista as etapas que quebraram; cada etapa
+traz tipo e mensagem do erro. Nao devolve senha nem token.
+
+Atalho mais barato ainda, sem deploy nenhum: `GET /cotacao/WA-0000`. Essa rota so valida
+o token e lista a pasta, sem renderizar. **404** significa SFTP e pasta bem, logo o erro
+do POST esta na renderizacao; **500** aponta para o SFTP.
+
 ### Teste da validade, sem esperar um dia
 
 Mude `COTACAO_VALIDADE_HORAS` para `0` no Render, espere o redeploy e chame o passo 4: a
