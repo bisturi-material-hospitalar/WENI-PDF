@@ -111,8 +111,37 @@ Dashboard → `bridge-danfe` → **Environment** → *Add Environment Variable*
 | `COTACAO_BASE_DIR` | a pasta que venceu o passo 1, ex. `/public/cotacao` |
 | `COTACAO_PUBLIC_BASE_URL` | `https://arquivos.bisturi.com.br/cotacao` |
 | `COTACAO_VALIDADE_HORAS` | `24` |
+| `COTACAO_STORAGE` | **nao criar por enquanto.** Só se o diagnóstico apontar o transporte — ver abaixo |
 
-### Dois nomes errados no dashboard (03/09/2026)
+### Transporte: o que e fato e o que era hipotese minha (03/09/2026)
+
+**Fato, verificado no painel da Umbler:** os recursos oferecidos sao FTPS (porta 21),
+Git Remote, Git via SSH ("execute comandos `git`") e o gerenciador web. Nao ha shell.
+
+**Hipotese minha, retratada:** concluir dai que "SFTP nao existe e nunca funcionou" foi
+erro meu. O DANFE grava nota usando o mesmo host, usuario e senha com
+`STORAGE_BACKEND=sftp`; se ele funciona, SFTP funciona. Os indicios que eu usei eram
+circunstanciais: os defaults divergentes dentro do `bridge_danfe.py`, a ausencia de chave
+de setembro na pasta, e o `/expurgo` que pendurou. Nenhum deles mede o transporte.
+
+**Consequencia de desenho:** `STORAGE_BACKEND` governa o DANFE, que esta em producao.
+Trocar essa variavel para investigar defeito da cotacao seria arriscar o que funciona
+para consertar o que nao funciona. Por isso a cotacao tem variavel propria:
+
+| Variavel | Efeito |
+|---|---|
+| (nenhuma) | a cotacao segue o `STORAGE_BACKEND` do servico |
+| `COTACAO_STORAGE=ftps` | **so a cotacao** usa FTPS; o DANFE continua no que estava |
+| `COTACAO_STORAGE=sftp` | forca SFTP so na cotacao |
+
+O FTPS fica implementado e testado (`testes/teste_cotacao_storage.py`, 22 assercoes com
+servidor falso), disponivel quando for preciso, e **nao** entra como default.
+
+Duas coisas que o FTP exige e o SFTP nao: a data de modificacao vem do fato `modify` do
+MLSD, em UTC, com fallback para `NLST` + `MDTM`; e a sessao TLS precisa ser reaproveitada
+no canal de dados (`_FTPSReuse`, copiado do `bridge_danfe.py`).
+
+### Dois nomes errados no dashboard (03/09/2026)### Dois nomes errados no dashboard (03/09/2026)
 
 Na lista de variáveis do `bridge-danfe` estão gravadas:
 
@@ -160,6 +189,7 @@ cd C:\Users\e-commerce-06.BISTURI\Downloads\weni-pdf
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt          # traz o reportlab, que e dependencia nova
 py testes\teste_cotacao_api.py           # esperado: TUDO OK
+py testes\teste_cotacao_storage.py       # FTPS com servidor falso: TUDO OK
 py cotacao_pdf.py                        # gera 3 PDFs de amostra para olhar o layout
 ```
 
@@ -226,7 +256,7 @@ Invoke-RestMethod "$base/cotacao-diagnostico" -Headers $h | ConvertTo-Json -Dept
 
 Ela reporta, uma por uma: ambiente (Python, reportlab, **Pillow** — sem ele o reportlab
 nao le PNG e o cabecalho com o logotipo estoura em tempo de renderizacao), o arquivo do
-logotipo, uma renderizacao minima, conexao SFTP, listagem da pasta e um teste de escrita
+logotipo, uma renderizacao minima, conexao com o armazenamento, listagem da pasta e um teste de escrita
 que grava e apaga um arquivo. O campo `falhas` lista as etapas que quebraram; cada etapa
 traz tipo e mensagem do erro. Nao devolve senha nem token.
 

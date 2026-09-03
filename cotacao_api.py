@@ -27,9 +27,11 @@ nome, endereco, CPF e IE. E o mesmo motivo pelo qual o README manda apagar o
 
 import os
 import re
+import io as _io
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
+from ftplib import FTP, FTP_TLS, error_perm
 from typing import List, Optional
 
 from fastapi import APIRouter, Header, HTTPException, Query
@@ -54,6 +56,26 @@ VALIDADE_HORAS = float(os.environ.get("COTACAO_VALIDADE_HORAS", 24))
 RE_NUMERO = re.compile(r"^[A-Za-z0-9]{2,12}(?:-[A-Za-z0-9]{2,12}){0,2}$")
 
 FUSO = timezone(timedelta(hours=-3))
+
+# Transporte de arquivo, com variavel PROPRIA.
+#
+# Por que propria e nao a `STORAGE_BACKEND` do servico: aquela governa o DANFE, que esta
+# em producao e funcionando. Trocar o transporte do DANFE para investigar um defeito da
+# cotacao seria arriscar o que funciona para consertar o que nao funciona. Com
+# `COTACAO_STORAGE` da para testar FTPS so na cotacao e deixar o DANFE intacto.
+#
+# Sem `COTACAO_STORAGE` definida, segue o `STORAGE_BACKEND` do servico — que e o
+# comportamento esperado no dia a dia, um transporte so para tudo.
+#
+# Contexto de 03/09/2026: o painel da Umbler oferece FTPS e SSH apenas para git, o que me
+# levou a concluir que SFTP nao existia nesse plano. **A conclusao estava errada** se o
+# DANFE grava nota por SFTP hoje — e ele usa o mesmo host, usuario e senha. O FTPS fica
+# implementado e testado, disponivel por esta variavel, mas nao entra como default.
+BACKEND = (
+    os.environ.get("COTACAO_STORAGE")
+    or os.environ.get("STORAGE_BACKEND", "sftp")
+).lower()
+TIMEOUT = float(os.environ.get("SFTP_TIMEOUT", 20))
 
 
 def checar_token(authorization: Optional[str]) -> None:
@@ -85,15 +107,113 @@ def gerar_numero() -> str:
     return f"COT-{agora():%d%m}-{sufixo}"
 
 
-# ------------------------------------------------------------------ storage (SFTP)
+# ------------------------------------------------------------------ storage
+#
+# Dois transportes, mesma interface: `subir`, `procurar`, `apagar_antigos`. O FTPS e o que
+# a Umbler oferece de fato; o SFTP fica porque o codigo do DANFE tem os dois e um dia o
+# armazenamento pode mudar. As tres funcoes publicas despacham por BACKEND.
+
+
+class _FTPSReuse(FTP_TLS):
+    """Reaproveita a sessao TLS no canal de dados — muitos servidores FTPS exigem.
+
+    Copiado do bridge_danfe.py de proposito: e o mesmo servidor, e a solucao que ja
+    funciona ali. Duplicar helper pequeno e a convencao da casa.
+    """
+
+    def ntransfercmd(self, cmd, rest=None):
+        conn, size = FTP.ntransfercmd(self, cmd, rest)
+        if self._prot_p:
+            conn = self.context.wrap_socket(
+                conn, server_hostname=self.host, session=self.sock.session
+            )
+        return conn, size
+
+
+def _ftps():
+    ftps = _FTPSReuse()
+    ftps.connect(
+        os.environ["SFTP_HOST"], int(os.environ.get("FTPS_PORT", 21)), timeout=TIMEOUT
+    )
+    ftps.login(os.environ["SFTP_USER"], os.environ["SFTP_PASSWORD"])
+    ftps.prot_p()        # criptografa o canal de dados
+    ftps.set_pasv(True)  # passivo: obrigatorio saindo de container
+    return ftps
+
+
+def _ftps_fechar(ftps) -> None:
+    try:
+        ftps.quit()
+    except Exception:
+        ftps.close()
+
+
+def _ftps_cd(ftps, pasta: str, criar: bool = False) -> None:
+    ftps.cwd("/")
+    for parte in [p for p in pasta.split("/") if p]:
+        try:
+            ftps.cwd(parte)
+        except error_perm:
+            if not criar:
+                raise
+            ftps.mkd(parte)
+            ftps.cwd(parte)
+
+
+def _epoch_de_modify(texto: str) -> float:
+    """"20260903T..." -> epoch. O fato `modify` do MLSD vem em UTC, sem fuso no texto."""
+    texto = texto.strip()[:14]
+    return datetime.strptime(texto, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc).timestamp()
+
+
+def _ftps_listar_com_data(ftps, prefixo: str) -> list:
+    """[(nome, epoch)] dos arquivos da pasta que comecam com `prefixo`.
+
+    Tenta MLSD, que devolve nome e data numa passada. Servidor que nao suporta MLSD cai
+    para NLST + MDTM por arquivo — mais chamadas, mas so nos que casam o prefixo, que
+    sao um ou dois.
+    """
+    achados = []
+    try:
+        for nome, fatos in ftps.mlsd(".", facts=["modify", "type"]):
+            if fatos.get("type") not in (None, "file"):
+                continue
+            if nome.startswith(prefixo) and nome.lower().endswith(".pdf"):
+                achados.append((nome, _epoch_de_modify(fatos.get("modify", "19700101000000"))))
+        return achados
+    except (error_perm, ValueError, KeyError):
+        pass
+
+    for nome in ftps.nlst():
+        nome = nome.rsplit("/", 1)[-1]
+        if not (nome.startswith(prefixo) and nome.lower().endswith(".pdf")):
+            continue
+        try:
+            resposta = ftps.voidcmd("MDTM " + nome)  # "213 20260903143000"
+            achados.append((nome, _epoch_de_modify(resposta.split()[-1])))
+        except (error_perm, ValueError, IndexError):
+            achados.append((nome, 0.0))
+    return achados
+
+
+# ------------------------------------------------------------------ SFTP
 
 
 def _sftp():
+    """Conecta no SFTP com prazo. O prazo e o ponto: `paramiko.Transport((host, porta))`
+    abre o socket sem timeout, e um destino que aceita a conexao e nao completa o
+    handshake deixa a requisicao pendurada para sempre — o cliente desiste, o container
+    fica ocupado e o log nao registra erro nenhum. Medido em 03/09 no /expurgo do DANFE.
+    """
+    import socket
+
     import paramiko
 
-    transport = paramiko.Transport(
-        (os.environ["SFTP_HOST"], int(os.environ.get("SFTP_PORT", 22)))
-    )
+    endereco = (os.environ["SFTP_HOST"], int(os.environ.get("SFTP_PORT", 22)))
+    sock = socket.create_connection(endereco, timeout=TIMEOUT)
+    transport = paramiko.Transport(sock)
+    transport.banner_timeout = TIMEOUT
+    transport.auth_timeout = TIMEOUT
     chave = os.environ.get("SFTP_KEY_PATH")
     if chave:
         transport.connect(
@@ -107,11 +227,7 @@ def _sftp():
     return paramiko.SFTPClient.from_transport(transport), transport
 
 
-def _garantir_pasta(sftp) -> None:
-    try:
-        sftp.stat(BASE_DIR)
-    except IOError:
-        sftp.mkdir(BASE_DIR)
+# ------------------------------------------------------------------ interface
 
 
 def subir(pdf_bytes: bytes, nome: str) -> str:
@@ -119,9 +235,27 @@ def subir(pdf_bytes: bytes, nome: str) -> str:
 
     Sem isso, quem abrir a URL no exato instante do upload baixa um PDF pela metade.
     """
+    if BACKEND == "ftps":
+        ftps = _ftps()
+        try:
+            _ftps_cd(ftps, BASE_DIR, criar=True)
+            parcial = nome + ".part"
+            ftps.storbinary(f"STOR {parcial}", _io.BytesIO(pdf_bytes))
+            try:
+                ftps.delete(nome)
+            except error_perm:
+                pass
+            ftps.rename(parcial, nome)
+        finally:
+            _ftps_fechar(ftps)
+        return f"{PUBLIC_BASE_URL}/{nome}"
+
     sftp, transport = _sftp()
     try:
-        _garantir_pasta(sftp)
+        try:
+            sftp.stat(BASE_DIR)
+        except IOError:
+            sftp.mkdir(BASE_DIR)
         destino = f"{BASE_DIR}/{nome}"
         parcial = destino + ".part"
         with sftp.file(parcial, "wb") as arquivo:
@@ -149,32 +283,84 @@ def procurar(numero: str) -> Optional[dict]:
     proprio numero.
     """
     prefixo = f"{numero}-"
+
+    if BACKEND == "ftps":
+        ftps = _ftps()
+        try:
+            try:
+                _ftps_cd(ftps, BASE_DIR)
+            except error_perm:
+                return None
+            achados = _ftps_listar_com_data(ftps, prefixo)
+        finally:
+            _ftps_fechar(ftps)
+    else:
+        sftp, transport = _sftp()
+        try:
+            try:
+                entradas = sftp.listdir_attr(BASE_DIR)
+            except IOError:
+                return None
+            achados = [
+                (e.filename, float(e.st_mtime or 0))
+                for e in entradas
+                if e.filename.startswith(prefixo) and e.filename.lower().endswith(".pdf")
+            ]
+        finally:
+            sftp.close()
+            transport.close()
+
+    if not achados:
+        return None
+
+    # Mais de um arquivo para o mesmo numero so acontece se alguem regerou; vale o mais
+    # novo.
+    nome, quando = max(achados, key=lambda par: par[1])
+    idade_h = (time.time() - quando) / 3600.0
+    return {
+        "nome": nome,
+        "url": f"{PUBLIC_BASE_URL}/{nome}",
+        "idade_horas": round(idade_h, 2),
+        "expirado": idade_h > VALIDADE_HORAS,
+        "gerado_em": datetime.fromtimestamp(quando, FUSO).isoformat(),
+    }
+
+
+def apagar_antigos(dias: int) -> int:
+    """Apaga PDF e .part com mais de `dias` dias. Devolve quantos foram apagados."""
+    limite = time.time() - dias * 86400
+    apagados = 0
+
+    if BACKEND == "ftps":
+        ftps = _ftps()
+        try:
+            try:
+                _ftps_cd(ftps, BASE_DIR)
+            except error_perm:
+                return 0
+            for nome, quando in _ftps_listar_com_data(ftps, ""):
+                if quando < limite:
+                    ftps.delete(nome)
+                    apagados += 1
+        finally:
+            _ftps_fechar(ftps)
+        return apagados
+
     sftp, transport = _sftp()
     try:
         try:
             entradas = sftp.listdir_attr(BASE_DIR)
         except IOError:
-            return None
-        achados = [
-            e for e in entradas
-            if e.filename.startswith(prefixo) and e.filename.lower().endswith(".pdf")
-        ]
-        if not achados:
-            return None
-        # Mais de um arquivo para o mesmo numero so acontece se alguem regerou; vale o
-        # mais novo.
-        recente = max(achados, key=lambda e: e.st_mtime or 0)
-        idade_h = (time.time() - (recente.st_mtime or 0)) / 3600.0
-        return {
-            "nome": recente.filename,
-            "url": f"{PUBLIC_BASE_URL}/{recente.filename}",
-            "idade_horas": round(idade_h, 2),
-            "expirado": idade_h > VALIDADE_HORAS,
-            "gerado_em": datetime.fromtimestamp(recente.st_mtime or 0, FUSO).isoformat(),
-        }
+            return 0
+        for entrada in entradas:
+            fim = entrada.filename.lower()
+            if (fim.endswith(".pdf") or fim.endswith(".part")) and (entrada.st_mtime or 0) < limite:
+                sftp.remove(f"{BASE_DIR}/{entrada.filename}")
+                apagados += 1
     finally:
         sftp.close()
         transport.close()
+    return apagados
 
 
 # ------------------------------------------------------------------ modelos
@@ -351,6 +537,7 @@ def diagnostico(authorization: str = Header(None)):
             "python": platform.python_version(),
             "reportlab": reportlab.Version,
             "pillow": pillow,
+            "backend": BACKEND,
             "base_dir": BASE_DIR,
             "public_base_url": PUBLIC_BASE_URL,
             "validade_horas": VALIDADE_HORAS,
@@ -388,24 +575,48 @@ def diagnostico(authorization: str = Header(None)):
         return {"bytes": len(pdf), "assinatura": pdf[:4].decode("latin-1")}
 
     def conexao():
+        if BACKEND == "ftps":
+            ftps = _ftps()
+            try:
+                return {"backend": "ftps", "boas_vindas": ftps.getwelcome()}
+            finally:
+                _ftps_fechar(ftps)
         sftp, transport = _sftp()
         try:
-            return {"conectado": True, "servidor": transport.getpeername()[0]}
+            return {"backend": "sftp", "servidor": transport.getpeername()[0]}
         finally:
             sftp.close()
             transport.close()
 
     def listagem():
+        if BACKEND == "ftps":
+            ftps = _ftps()
+            try:
+                _ftps_cd(ftps, BASE_DIR)
+                return {"pasta": BASE_DIR, "arquivos": len(ftps.nlst())}
+            finally:
+                _ftps_fechar(ftps)
         sftp, transport = _sftp()
         try:
-            nomes = sftp.listdir(BASE_DIR)
-            return {"pasta": BASE_DIR, "arquivos": len(nomes)}
+            return {"pasta": BASE_DIR, "arquivos": len(sftp.listdir(BASE_DIR))}
         finally:
             sftp.close()
             transport.close()
 
     def escrita():
+        """Grava e apaga uma sonda. E o teste que prova permissao de escrita, que
+        listagem sozinha nao prova."""
         nome = f"diagnostico-{secrets.token_urlsafe(8)}.txt"
+        if BACKEND == "ftps":
+            ftps = _ftps()
+            try:
+                _ftps_cd(ftps, BASE_DIR, criar=True)
+                ftps.storbinary(f"STOR {nome}", _io.BytesIO(b"diagnostico\n"))
+                tamanho = ftps.size(nome)
+                ftps.delete(nome)
+                return {"gravou_e_apagou": True, "bytes": tamanho, "nome": nome}
+            finally:
+                _ftps_fechar(ftps)
         sftp, transport = _sftp()
         try:
             caminho = f"{BASE_DIR}/{nome}"
@@ -422,9 +633,9 @@ def diagnostico(authorization: str = Header(None)):
         ("ambiente", ambiente),
         ("logo", logo),
         ("renderizacao", render),
-        ("sftp_conexao", conexao),
-        ("sftp_listagem", listagem),
-        ("sftp_escrita", escrita),
+        ("armazenamento_conexao", conexao),
+        ("armazenamento_listagem", listagem),
+        ("armazenamento_escrita", escrita),
     ):
         etapa(nome, funcao)
 
@@ -448,24 +659,7 @@ def expurgar_cotacoes(dias: int = 30, authorization: str = Header(None)):
     checar_token(authorization)
     if dias < 1:
         raise HTTPException(400, "dias tem de ser 1 ou mais.")
-
-    limite = time.time() - dias * 86400
-    sftp, transport = _sftp()
-    apagados = 0
-    try:
-        try:
-            entradas = sftp.listdir_attr(BASE_DIR)
-        except IOError:
-            return {"apagados": 0, "dias": dias}
-        for entrada in entradas:
-            fim = entrada.filename.lower()
-            if (fim.endswith(".pdf") or fim.endswith(".part")) and (entrada.st_mtime or 0) < limite:
-                sftp.remove(f"{BASE_DIR}/{entrada.filename}")
-                apagados += 1
-    finally:
-        sftp.close()
-        transport.close()
-    return {"apagados": apagados, "dias": dias}
+    return {"apagados": apagar_antigos(dias), "dias": dias, "pasta": BASE_DIR}
 
 
 @router.get("/cotacao/{numero}/existe")

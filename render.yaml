@@ -16,8 +16,14 @@ services:
       - key: PYTHON_VERSION
         value: "3.12"
       # --- fixos, podem ficar no arquivo ---
+      # Transporte do DANFE. NAO mexer para investigar defeito da cotacao: o DANFE esta
+      # em producao com este valor. A cotacao tem variavel propria (COTACAO_STORAGE) e
+      # pode ser testada em ftps sem tocar aqui.
       - key: STORAGE_BACKEND
         value: sftp
+      # Porta do FTPS, usada pelos dois modulos quando o transporte e ftps.
+      - key: FTPS_PORT
+        value: "21"
       - key: SFTP_HOST
         value: arquivos-bisturi-com-br.umbler.net
       - key: SFTP_PORT
