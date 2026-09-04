@@ -221,9 +221,19 @@ def _valor_brl(centavos) -> Optional[str]:
 
 
 def checar_token(authorization: Optional[str]) -> None:
+    """Confere o Bearer token.
+
+    O esquema e comparado sem diferenciar maiuscula ("Bearer", "bearer", "BEARER"),
+    porque o RFC 7235 define o esquema como case-insensitive e a comparacao literal
+    anterior transformava um `bearer` minusculo digitado no cron num 401 sem explicacao.
+    O token em si continua comparado byte a byte.
+    """
     esperado = os.environ.get("BRIDGE_TOKEN")
-    if not esperado or authorization != f"Bearer {esperado}":
-        raise HTTPException(401, "Não autorizado.")
+    if not esperado:
+        raise HTTPException(401, "Nao autorizado.")
+    partes = (authorization or "").split()
+    if len(partes) != 2 or partes[0].lower() != "bearer" or partes[1] != esperado:
+        raise HTTPException(401, "Nao autorizado.")
 
 app = FastAPI(title="Bridge DANFE", version="1.0")
 
@@ -905,6 +915,16 @@ import io
 from ftplib import FTP, FTP_TLS, error_perm
 
 
+def _credencial(nome: str) -> str:
+    """Le a variavel de ambiente e tira espaco e quebra de linha das pontas.
+
+    Campo de dashboard aceita um espaco a mais no fim do valor sem mostrar nada, e uma
+    senha com espaco invisivel devolve `530 Login authentication failed`, identico a
+    senha errada. Achado em 03/09/2026.
+    """
+    return (os.environ.get(nome) or "").strip()
+
+
 def _sftp():
     """Conecta no SFTP COM PRAZO.
 
@@ -921,7 +941,7 @@ def _sftp():
     import paramiko
 
     prazo = float(os.environ.get("SFTP_TIMEOUT", 15))
-    endereco = (os.environ["SFTP_HOST"], int(os.environ.get("SFTP_PORT", 22)))
+    endereco = (_credencial("SFTP_HOST"), int(_credencial("SFTP_PORT") or 22))
     sock = socket.create_connection(endereco, timeout=prazo)
     transport = paramiko.Transport(sock)
     transport.banner_timeout = prazo
@@ -929,10 +949,10 @@ def _sftp():
     key_path = os.environ.get("SFTP_KEY_PATH")
     if key_path:
         pkey = paramiko.RSAKey.from_private_key_file(key_path)
-        transport.connect(username=os.environ["SFTP_USER"], pkey=pkey)
+        transport.connect(username=_credencial("SFTP_USER"), pkey=pkey)
     else:
         transport.connect(
-            username=os.environ["SFTP_USER"], password=os.environ["SFTP_PASSWORD"]
+            username=_credencial("SFTP_USER"), password=_credencial("SFTP_PASSWORD")
         )
     return paramiko.SFTPClient.from_transport(transport), transport
 
@@ -1000,8 +1020,8 @@ class _FTPSReuse(FTP_TLS):
 
 def _ftps():
     ftps = _FTPSReuse()
-    ftps.connect(os.environ["SFTP_HOST"], int(os.environ.get("FTPS_PORT", 21)), timeout=30)
-    ftps.login(os.environ["SFTP_USER"], os.environ["SFTP_PASSWORD"])
+    ftps.connect(_credencial("SFTP_HOST"), int(_credencial("FTPS_PORT") or 21), timeout=30)
+    ftps.login(_credencial("SFTP_USER"), _credencial("SFTP_PASSWORD"))
     ftps.prot_p()          # criptografa o canal de dados
     ftps.set_pasv(True)    # passivo: obrigatório saindo de container
     return ftps
@@ -1478,8 +1498,20 @@ def pregerar(
         "tempo_esgotado": False,
     }
 
-    # uma conexão FTPS para o lote inteiro, em vez de uma por arquivo
-    conn = _ftps() if STORAGE_BACKEND == "ftps" else None
+    # Uma conexao FTPS para o lote inteiro, em vez de uma por arquivo.
+    # Dentro do try/except de proposito: esta linha ficava fora, e falha de credencial
+    # derrubava a requisicao com 500 sem resumo — justamente o contrario do desenho da
+    # rota, que existe para um pedido problematico nao abortar o lote. Medido em 03/09.
+    conn = None
+    if STORAGE_BACKEND == "ftps":
+        try:
+            conn = _ftps()
+        except Exception as exc:
+            resumo["erros"].append({"pedido": "(conexao do lote)",
+                                    "erro": f"{type(exc).__name__}: {exc}"})
+            resumo["segundos"] = round(time.monotonic() - comeco, 1)
+            resumo["memoria"] = len(_PREGERADOS)
+            return resumo
     try:
         for item in listar_pedidos_faturados():
             if len(resumo["geradas"]) >= limite:

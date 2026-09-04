@@ -79,9 +79,18 @@ TIMEOUT = float(os.environ.get("SFTP_TIMEOUT", 20))
 
 
 def checar_token(authorization: Optional[str]) -> None:
-    """Mesma chave do DANFE. Repetida aqui de proposito, para nao importar o bridge."""
+    """Mesma chave do DANFE, repetida aqui de proposito para nao importar o bridge.
+
+    O esquema e comparado sem diferenciar maiuscula ("Bearer", "bearer", "BEARER"),
+    porque o RFC 7235 define o esquema como case-insensitive e a comparacao literal
+    anterior transformava um `bearer` minusculo digitado no cron num 401 sem explicacao.
+    O token em si continua comparado byte a byte.
+    """
     esperado = os.environ.get("BRIDGE_TOKEN")
-    if not esperado or authorization != f"Bearer {esperado}":
+    if not esperado:
+        raise HTTPException(401, "Nao autorizado.")
+    partes = (authorization or "").split()
+    if len(partes) != 2 or partes[0].lower() != "bearer" or partes[1] != esperado:
         raise HTTPException(401, "Nao autorizado.")
 
 
@@ -130,12 +139,22 @@ class _FTPSReuse(FTP_TLS):
         return conn, size
 
 
+def _credencial(nome: str) -> str:
+    """Le a variavel e tira espaco e quebra de linha das pontas.
+
+    Campo de dashboard aceita um espaco a mais no fim do valor sem mostrar nada. Uma
+    senha com espaco invisivel devolve `530 Login authentication failed`, identico a
+    senha errada — e foi meia hora de investigacao em 03/09/2026.
+    """
+    return (os.environ.get(nome) or "").strip()
+
+
 def _ftps():
     ftps = _FTPSReuse()
     ftps.connect(
-        os.environ["SFTP_HOST"], int(os.environ.get("FTPS_PORT", 21)), timeout=TIMEOUT
+        _credencial("SFTP_HOST"), int(_credencial("FTPS_PORT") or 21), timeout=TIMEOUT
     )
-    ftps.login(os.environ["SFTP_USER"], os.environ["SFTP_PASSWORD"])
+    ftps.login(_credencial("SFTP_USER"), _credencial("SFTP_PASSWORD"))
     ftps.prot_p()        # criptografa o canal de dados
     ftps.set_pasv(True)  # passivo: obrigatorio saindo de container
     return ftps
@@ -209,7 +228,7 @@ def _sftp():
 
     import paramiko
 
-    endereco = (os.environ["SFTP_HOST"], int(os.environ.get("SFTP_PORT", 22)))
+    endereco = (_credencial("SFTP_HOST"), int(_credencial("SFTP_PORT") or 22))
     sock = socket.create_connection(endereco, timeout=TIMEOUT)
     transport = paramiko.Transport(sock)
     transport.banner_timeout = TIMEOUT
@@ -217,12 +236,12 @@ def _sftp():
     chave = os.environ.get("SFTP_KEY_PATH")
     if chave:
         transport.connect(
-            username=os.environ["SFTP_USER"],
+            username=_credencial("SFTP_USER"),
             pkey=paramiko.RSAKey.from_private_key_file(chave),
         )
     else:
         transport.connect(
-            username=os.environ["SFTP_USER"], password=os.environ["SFTP_PASSWORD"]
+            username=_credencial("SFTP_USER"), password=_credencial("SFTP_PASSWORD")
         )
     return paramiko.SFTPClient.from_transport(transport), transport
 
@@ -521,6 +540,25 @@ def diagnostico(authorization: str = Header(None)):
                 {"etapa": nome, "ok": False, "detalhe": f"{type(exc).__name__}: {exc}"}
             )
 
+    def credenciais():
+        """Descreve os valores sem revelar a senha.
+
+        Mostra usuario (que nao e segredo — aparece no painel) e, da senha, so tamanho e
+        se tem espaco nas pontas. E o suficiente para achar erro de copia e cola, que e a
+        causa mais comum de 530 com credencial "certa".
+        """
+        bruto_usuario = os.environ.get("SFTP_USER") or ""
+        bruto_senha = os.environ.get("SFTP_PASSWORD") or ""
+        return {
+            "host": _credencial("SFTP_HOST"),
+            "porta_ftps": _credencial("FTPS_PORT") or "21",
+            "usuario": _credencial("SFTP_USER") or "(vazio)",
+            "usuario_tem_espaco_nas_pontas": bruto_usuario != bruto_usuario.strip(),
+            "senha_definida": bool(bruto_senha),
+            "senha_caracteres": len(_credencial("SFTP_PASSWORD")),
+            "senha_tem_espaco_nas_pontas": bruto_senha != bruto_senha.strip(),
+        }
+
     def ambiente():
         import platform
         import reportlab
@@ -631,6 +669,7 @@ def diagnostico(authorization: str = Header(None)):
 
     for nome, funcao in (
         ("ambiente", ambiente),
+        ("credenciais", credenciais),
         ("logo", logo),
         ("renderizacao", render),
         ("armazenamento_conexao", conexao),
