@@ -340,27 +340,88 @@ def gerar_pdf(dados: dict, caminho=None) -> bytes:
     fluxo += [totais, Spacer(1, 6)]
 
     # -------------------------------------------------------------- pendencias
+    #
+    # ATENCAO ao mexer aqui: este bloco JA QUEBROU EM PRODUCAO. Medido em 09/09/2026.
+    #
+    # A versao anterior punha todas as pendencias numa Table de UMA celula e ainda embrulhava
+    # em KeepTogether. Celula de tabela nao parte entre paginas no reportlab, e o
+    # KeepTogether pedia explicitamente para nao partir — entao o bloco inteiro tinha de
+    # caber numa pagina. Passando de 21 pendencias (com 2 alternativas cada) a altura passa
+    # dos 767 pt do frame e o reportlab levanta LayoutError: a bridge devolve 500, a tool
+    # recebe None e o cliente ouve "nao consegui gerar o PDF agora".
+    #
+    # Era falha DETERMINISTICA, nao intermitente: a mesma lista falhava em toda tentativa,
+    # e a mensagem "me peca de novo e eu envio" prometia o que nunca ia sair. Uma cotacao
+    # real de 09/09 com 32 pendencias caiu exatamente aqui.
+    #
+    # Correcao: cortar as pendencias em grupos medidos pela altura real de cada flowable e
+    # emitir uma caixa por grupo, SEM KeepTogether. Os grupos fluem entre paginas. O corte
+    # e por altura medida e nao por contagem fixa porque a altura de cada pendencia varia
+    # com o tamanho da descricao e o numero de alternativas.
     if dados.get("pendentes"):
-        bloco = [Paragraph("ITENS QUE PRECISAM DA SUA CONFIRMAÇÃO", CAB), Spacer(1, 2)]
+        # Largura util dentro da caixa: L menos o LEFTPADDING de 5 e uma folga de 1 pt.
+        LARGURA_INTERNA = L - 6
+        # Altura util: o frame do template menos o padding vertical da caixa (4+4) e uma
+        # folga de 24 pt para o Spacer seguinte e erro de arredondamento do wrap.
+        ALTURA_UTIL = doc.height - 32
+
+        def _medir(flowable) -> float:
+            return flowable.wrap(LARGURA_INTERNA, ALTURA_UTIL)[1]
+
+        # Cada pendencia e um grupo indivisivel de linhas: o titulo e suas alternativas nao
+        # devem ser separados. Por isso o corte acontece ENTRE pendencias, nunca dentro.
+        grupos = []
         for p in dados["pendentes"]:
-            bloco.append(Paragraph(
-                f"<b>{p['descricao']}</b> ({num(p['quantidade'], 0)}) &mdash; {p['motivo']}", P))
+            linhas = [Paragraph(
+                f"<b>{p['descricao']}</b> ({num(p['quantidade'], 0)}) &mdash; {p['motivo']}", P)]
             for letra, alt in zip("abcde", p.get("alternativas", [])):
-                bloco.append(Paragraph(
-                    f"&nbsp;&nbsp;&nbsp;<b>{letra})</b> {alt['descricao']} &mdash; {num(alt['unitario'])}", P))
-            bloco.append(Spacer(1, 2))
+                linhas.append(Paragraph(
+                    f"&nbsp;&nbsp;&nbsp;<b>{letra})</b> {alt['descricao']} &mdash; "
+                    f"{num(alt['unitario'])}", P))
+            linhas.append(Spacer(1, 2))
+            grupos.append(linhas)
+
         if dados.get("nao_localizados"):
-            bloco.append(Paragraph(
+            grupos.append([Paragraph(
                 "<b>Não localizados:</b> " + "; ".join(dados["nao_localizados"])
-                + ". Envie a marca, o código ou uma foto da embalagem.", P))
-        caixa = Table([[bloco]], colWidths=[L])
-        caixa.setStyle(TableStyle(SEM_PADDING + [
+                + ". Envie a marca, o código ou uma foto da embalagem.", P)])
+
+        def _cabecalho(continuacao: bool):
+            texto = ("ITENS QUE PRECISAM DA SUA CONFIRMAÇÃO (continuação)" if continuacao
+                     else "ITENS QUE PRECISAM DA SUA CONFIRMAÇÃO")
+            return [Paragraph(texto, CAB), Spacer(1, 2)]
+
+        caixas: list = []
+        atual = _cabecalho(False)
+        altura = sum(_medir(f) for f in atual)
+
+        for linhas in grupos:
+            alto = sum(_medir(f) for f in linhas)
+            # Grupo que sozinho nao cabe numa pagina entra de qualquer forma: e melhor uma
+            # pagina apertada do que LayoutError. Nao acontece com pendencia de 5
+            # alternativas, mas nao vale confiar em nome de produto ter tamanho maximo.
+            if altura + alto > ALTURA_UTIL and len(atual) > 2:
+                caixas.append(atual)
+                atual = _cabecalho(True)
+                altura = sum(_medir(f) for f in atual)
+            atual.extend(linhas)
+            altura += alto
+
+        if len(atual) > 2:
+            caixas.append(atual)
+
+        estilo_caixa = TableStyle(SEM_PADDING + [
             ("BOX", (0, 0), (-1, -1), 0.9, PRETO),
             ("TOPPADDING", (0, 0), (-1, -1), 4),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
             ("LEFTPADDING", (0, 0), (-1, -1), 5),
-        ]))
-        fluxo += [KeepTogether(caixa), Spacer(1, 6)]
+        ])
+        for conteudo in caixas:
+            caixa = Table([[conteudo]], colWidths=[L])
+            caixa.setStyle(estilo_caixa)
+            # Sem KeepTogether: cada caixa cabe numa pagina por construcao, e a proxima
+            # desce naturalmente para a pagina seguinte.
+            fluxo += [caixa, Spacer(1, 6)]
 
     # ------------------------------------------------------------------ rodape
     # As duas linhas de advertencia de entrega existem no orcamento do Winthor e foram
