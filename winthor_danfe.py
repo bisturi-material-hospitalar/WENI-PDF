@@ -66,18 +66,6 @@ def pedido_do_winthor(order_id: str) -> bool:
     return bool(RE_PEDIDO_WINTHOR.fullmatch((order_id or "").strip()))
 
 
-def rca_do_pedido(order_id: str) -> Optional[str]:
-    """
-    Código do RCA que originou o pedido, pelo prefixo do número.
-
-    Serve para log e para distinguir origem: 69 é o e-commerce do site,
-    257 é o atendimento automatizado. Não é usado para decidir nada — o
-    prefixo pode mudar sem aviso quando um RCA novo é cadastrado.
-    """
-    num = (order_id or "").strip()
-    return num[:3] if len(num) >= 6 else None
-
-
 def _headers() -> dict:
     agora = time.time()
     if _TOKEN_CACHE["valor"] and agora < _TOKEN_CACHE["expira_em"]:

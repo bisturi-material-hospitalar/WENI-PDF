@@ -115,7 +115,16 @@ def checar(nome, condicao, detalhe=""):
 print("== autenticacao ==")
 esperar_erro(401, api.criar_cotacao, req(), None)
 esperar_erro(401, api.criar_cotacao, req(), "Bearer errado")
-checar("sem token nao passa", True)
+esperar_erro(401, api.criar_cotacao, req(), "")
+esperar_erro(401, api.criar_cotacao, req(), "token-de-teste")          # sem esquema
+esperar_erro(401, api.criar_cotacao, req(), "Basic token-de-teste")    # esquema errado
+esperar_erro(401, api.criar_cotacao, req(), "Bearer {{token}}")        # placeholder do cron
+checar("sem token, token errado, sem esquema e placeholder: todos 401", True)
+# O esquema e case-insensitive (RFC 7235). Um "bearer" minusculo digitado no cron dava
+# 401 sem explicacao — achado em 03/09/2026 ao configurar o cron do /pregerar.
+for _esquema in ("Bearer", "bearer", "BEARER"):
+    api.checar_token(f"{_esquema} token-de-teste")
+checar("Bearer, bearer e BEARER todos aceitos", True)
 
 print("\n== numero gerado ==")
 r1 = api.criar_cotacao(req(), AUTH)
