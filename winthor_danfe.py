@@ -14,7 +14,7 @@ Integração no bridge_danfe.py — três pontos:
 
     # em gerar_notas_do_pedido (era: encontrados = extrair_xmls(...))
     if pedido_do_winthor(order_id):
-        encontrados = extrair_xmls_winthor(order_id, invoice_number)
+        encontrados = extrair_xmls_winthor(order_id, invoice_number, info_saida)
     else:
         encontrados = extrair_xmls(buscar_pedido_vtex(order_id), invoice_number)
 
@@ -132,7 +132,9 @@ def _nnf_do_xml(xml: str) -> Optional[str]:
 
 
 def extrair_xmls_winthor(
-    order_id: str, invoice_number: Optional[str] = None
+    order_id: str,
+    invoice_number: Optional[str] = None,
+    info_saida: Optional[dict] = None,
 ) -> List[dict]:
     """
     Pedido do Winthor -> [{"xml": ..., "invoiceNumber": ...}].
@@ -145,6 +147,12 @@ def extrair_xmls_winthor(
       - pedido existe e não está faturado      -> [] , que virá como 409
         ("nota ainda não emitida") lá no endpoint
       - falha de rede ou de auth               -> 502
+
+    `info_saida`: dict opcional preenchido com o que já foi descoberto sobre o
+    pedido no caminho. Serve para o caso "existe mas não faturado" não virar um
+    beco sem saída: o status já foi consultado aqui para decidir se há nota, e
+    jogá-lo fora obrigava o cliente a repetir a pergunta em outro agente. Quem
+    chama decide se usa; nada aqui muda de comportamento por causa dele.
     """
     if not WINTHOR_URL:
         raise HTTPException(503, "Consulta ao Winthor não configurada.")
@@ -154,6 +162,8 @@ def extrair_xmls_winthor(
 
     if status is None:
         raise HTTPException(404, f"Pedido {order_id} não localizado.")
+    if info_saida is not None:
+        info_saida["orderStatus"] = status
     if status != "F":
         return []               # existe, mas ainda não faturado
 

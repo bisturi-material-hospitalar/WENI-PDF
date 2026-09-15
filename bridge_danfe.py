@@ -1212,7 +1212,10 @@ def listar_chaves(conn=None) -> List[str]:
 
 
 def gerar_notas_do_pedido(
-    order_id: str, invoice_number: Optional[str] = None, conn=None
+    order_id: str,
+    invoice_number: Optional[str] = None,
+    conn=None,
+    info_saida: Optional[dict] = None,
 ) -> List["NotaResponse"]:
     """
     Pedido -> lista de NotaResponse, gerando o PDF só do que ainda não existe.
@@ -1223,7 +1226,7 @@ def gerar_notas_do_pedido(
     tratamento é idêntico, então nota do ERP sai no mesmo formato de entrega.
     """
     if pedido_do_winthor(order_id):
-        encontrados = extrair_xmls_winthor(order_id, invoice_number)
+        encontrados = extrair_xmls_winthor(order_id, invoice_number, info_saida)
     else:
         encontrados = extrair_xmls(buscar_pedido_vtex(order_id), invoice_number)
     notas = []
@@ -1416,13 +1419,28 @@ def danfe(req: PedidoRequest, authorization: str = Header(None)):
             "Pedido fora do escopo desta consulta (não é pedido do site).",
         )
 
-    notas = gerar_notas_do_pedido(req.orderId, req.invoiceNumber)
+    info_pedido: dict = {}
+    notas = gerar_notas_do_pedido(
+        req.orderId, req.invoiceNumber, info_saida=info_pedido
+    )
 
     if not notas:
         # 409: pedido existe mas ainda não tem nota com XML. O agente deve
         # responder "sua nota ainda não foi emitida", não "erro".
+        #
+        # O detail vira objeto para carregar o orderStatus do WinThor, que o
+        # caminho do ERP já descobriu ao decidir se havia nota. Sem isso o
+        # cliente ouvia só "ainda não foi emitida" e precisava repetir a
+        # pergunta em outro agente para saber em que pé está o pedido.
+        # Continua 409 e continua trazendo a mesma frase em "mensagem", então
+        # quem lê só o status HTTP não muda de comportamento.
         raise HTTPException(
-            409, "Pedido sem nota fiscal disponível (ainda não emitida)."
+            409,
+            {
+                "motivo": "pedido_sem_nota",
+                "mensagem": "Pedido sem nota fiscal disponível (ainda não emitida).",
+                "orderStatus": info_pedido.get("orderStatus"),
+            },
         )
 
     return RespostaOk(orderId=req.orderId, notas=notas)
