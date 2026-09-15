@@ -472,7 +472,7 @@ def buscar_notas_por_email(email: str, documento: str) -> List["OpcaoNota"]:
     return opcoes[:EMAIL_MAX_OPCOES]
 
 
-def buscar_notas_por_documento(documento: str) -> List["OpcaoNota"]:
+def buscar_notas_por_documento(documento: str):
     """
     Lista as notas fiscais de um cliente a partir só do CPF/CNPJ.
 
@@ -482,17 +482,24 @@ def buscar_notas_por_documento(documento: str) -> List["OpcaoNota"]:
 
     Diferença de garantia entre as duas origens, e vale saber qual é qual:
 
-      VTEX   a busca livre (?q=) é aproximada e pode nem indexar o documento.
-             Por isso cada pedido é aberto e o documento é conferido contra
-             clientProfileData antes de entrar na lista — pedido de outro
-             cliente não passa. Se a busca livre não indexar CPF, esta origem
-             devolve vazio, e o ERP ainda responde. NÃO VERIFICADO contra a
-             conta da Bisturi.
+      VTEX   a busca livre (?q=) é aproximada, então cada pedido é aberto e o
+             documento conferido contra clientProfileData antes de entrar na
+             lista — pedido de outro cliente não passa. Que o ?q= indexa o
+             documento foi VERIFICADO em 15/09/2026 contra a conta da Bisturi:
+             CPF 558... devolveu o pedido 1661841012374-01, cujo
+             clientProfileData.document é esse mesmo CPF.
       ERP    customer/list?personIdentificationNumber= é busca exata pelo
              documento, não aproximada. Não há o que conferir depois.
+
+    Devolve (opcoes, tem_marketplace). O segundo existe porque a Bisturi emite
+    site e marketplace na mesma numeração: um cliente que só comprou em
+    marketplace tem nota, mas não é nota deste fluxo. Sem esse sinal a resposta
+    seria "não localizei", e o cliente ficaria procurando um número que existe.
+    É a mesma distinção que o caminho do número da nota já faz com o 400.
     """
     doc = so_digitos(documento)
     opcoes: List[OpcaoNota] = []
+    tem_marketplace = False
 
     # ---- origem 1: VTEX ----
     account = os.environ["VTEX_ACCOUNT"]
@@ -524,8 +531,6 @@ def buscar_notas_por_documento(documento: str) -> List["OpcaoNota"]:
             if len(opcoes) >= EMAIL_MAX_OPCOES or abertos >= EMAIL_MAX_ABRIR:
                 break
             order_id = (item.get("orderId") or "").strip()
-            if not pedido_do_site(order_id):
-                continue
             emitidas = [
                 str(n).strip().lstrip("0")
                 for n in (item.get("invoiceOutput") or [])
@@ -536,6 +541,11 @@ def buscar_notas_por_documento(documento: str) -> List["OpcaoNota"]:
             criado = _data_vtex(item.get("creationDate"))
             if criado and criado < corte:
                 break
+            if not pedido_do_site(order_id):
+                # nota existe, mas é de marketplace: fora deste fluxo. Marca e
+                # segue — a marcação só importa se nada do site for achado.
+                tem_marketplace = True
+                continue
             abertos += 1
             try:
                 perfil = (buscar_pedido_vtex(order_id).get("clientProfileData")) or {}
@@ -576,7 +586,7 @@ def buscar_notas_por_documento(documento: str) -> List["OpcaoNota"]:
             # ERP fora do ar não invalida o que a VTEX já achou
             pass
 
-    return opcoes
+    return opcoes, tem_marketplace
 
 
 def extrair_xmls(pedido: dict, invoice_number: Optional[str] = None) -> List[dict]:
@@ -1482,7 +1492,17 @@ def danfe(req: PedidoRequest, authorization: str = Header(None)):
                     422, "CPF/CNPJ inválido (dígito verificador não confere)."
                 )
 
-            opcoes = buscar_notas_por_documento(req.documento)
+            opcoes, tem_marketplace = buscar_notas_por_documento(req.documento)
+            if not opcoes and tem_marketplace:
+                # O cliente TEM nota, só que de compra em marketplace. Mesmo
+                # 400 do caminho do número da nota, para o agente cair na mesma
+                # regra: dizer que a compra não é do site em vez de mandar
+                # conferir um dado que está certo.
+                raise HTTPException(
+                    400,
+                    "Notas localizadas para esse CPF/CNPJ pertencem a pedidos "
+                    "que não são do site.",
+                )
             if not opcoes:
                 raise HTTPException(
                     404,
