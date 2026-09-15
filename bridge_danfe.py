@@ -66,6 +66,7 @@ from pydantic import BaseModel
 
 from winthor_danfe import (
     extrair_xmls_winthor,
+    notas_do_cliente,
     pedido_do_winthor,
     pedido_por_numero_nota,
 )
@@ -469,6 +470,113 @@ def buscar_notas_por_email(email: str, documento: str) -> List["OpcaoNota"]:
             )
 
     return opcoes[:EMAIL_MAX_OPCOES]
+
+
+def buscar_notas_por_documento(documento: str) -> List["OpcaoNota"]:
+    """
+    Lista as notas fiscais de um cliente a partir só do CPF/CNPJ.
+
+    Junta as duas origens, na mesma ordem do resto do serviço — site primeiro,
+    ERP em seguida — e devolve a lista de opções sem gerar PDF nenhum, igual
+    ao caminho do e-mail. O PDF sai depois, pelo invoiceNumber.
+
+    Diferença de garantia entre as duas origens, e vale saber qual é qual:
+
+      VTEX   a busca livre (?q=) é aproximada e pode nem indexar o documento.
+             Por isso cada pedido é aberto e o documento é conferido contra
+             clientProfileData antes de entrar na lista — pedido de outro
+             cliente não passa. Se a busca livre não indexar CPF, esta origem
+             devolve vazio, e o ERP ainda responde. NÃO VERIFICADO contra a
+             conta da Bisturi.
+      ERP    customer/list?personIdentificationNumber= é busca exata pelo
+             documento, não aproximada. Não há o que conferir depois.
+    """
+    doc = so_digitos(documento)
+    opcoes: List[OpcaoNota] = []
+
+    # ---- origem 1: VTEX ----
+    account = os.environ["VTEX_ACCOUNT"]
+    env = os.environ.get("VTEX_ENVIRONMENT", "vtexcommercestable")
+    try:
+        resp = requests.get(
+            f"https://{account}.{env}.com.br/api/oms/pvt/orders",
+            params={
+                "q": doc,
+                "f_status": "invoiced",
+                "orderBy": "creationDate,desc",
+                "per_page": max(EMAIL_MAX_ABRIR, 15),
+                "page": 1,
+            },
+            headers={
+                "X-VTEX-API-AppKey": os.environ["VTEX_APP_KEY"],
+                "X-VTEX-API-AppToken": os.environ["VTEX_APP_TOKEN"],
+                "Accept": "application/json",
+            },
+            timeout=TIMEOUT,
+        )
+    except requests.exceptions.RequestException:
+        resp = None
+
+    if resp is not None and resp.status_code == 200:
+        corte = datetime.now(timezone.utc) - timedelta(days=EMAIL_JANELA_DIAS)
+        abertos = 0
+        for item in ((resp.json() or {}).get("list")) or []:
+            if len(opcoes) >= EMAIL_MAX_OPCOES or abertos >= EMAIL_MAX_ABRIR:
+                break
+            order_id = (item.get("orderId") or "").strip()
+            if not pedido_do_site(order_id):
+                continue
+            emitidas = [
+                str(n).strip().lstrip("0")
+                for n in (item.get("invoiceOutput") or [])
+                if str(n).strip()
+            ]
+            if not emitidas:
+                continue
+            criado = _data_vtex(item.get("creationDate"))
+            if criado and criado < corte:
+                break
+            abertos += 1
+            try:
+                perfil = (buscar_pedido_vtex(order_id).get("clientProfileData")) or {}
+            except HTTPException:
+                continue
+            documentos = {
+                so_digitos(perfil.get("document")),
+                so_digitos(perfil.get("corporateDocument")),
+            }
+            if doc not in documentos:
+                continue
+            data_br = criado.strftime("%d/%m/%Y") if criado else None
+            for numero in emitidas:
+                opcoes.append(
+                    OpcaoNota(
+                        numero=numero,
+                        orderId=order_id,
+                        data_pedido=data_br,
+                        valor=_valor_brl(item.get("totalValue")),
+                    )
+                )
+
+    # ---- origem 2: ERP ----
+    if len(opcoes) < EMAIL_MAX_OPCOES:
+        try:
+            for achada in notas_do_cliente(doc):
+                if len(opcoes) >= EMAIL_MAX_OPCOES:
+                    break
+                opcoes.append(
+                    OpcaoNota(
+                        numero=achada["numero"],
+                        orderId=achada["orderId"],
+                        data_pedido=achada.get("data_pedido"),
+                        valor=achada.get("valor"),
+                    )
+                )
+        except HTTPException:
+            # ERP fora do ar não invalida o que a VTEX já achou
+            pass
+
+    return opcoes
 
 
 def extrair_xmls(pedido: dict, invoice_number: Optional[str] = None) -> List[dict]:
@@ -1358,9 +1466,43 @@ def danfe(req: PedidoRequest, authorization: str = Header(None)):
             # gerado aqui — o escolhido vem depois, por invoiceNumber.
             return RespostaOk(email=req.email.strip(), opcoes=opcoes)
 
+        # ---- caminho 4: só o CPF/CNPJ ----
+        # Terceira porta de entrada, ao lado do número do pedido e do da nota.
+        # O cliente que não guardou nenhum número tem o próprio documento, e
+        # era o dado que ele mais oferecia espontaneamente.
+        #
+        # Aqui o documento é chave de busca E identidade ao mesmo tempo, ao
+        # contrário do caminho do e-mail, onde ele é só a prova. Isso é uma
+        # decisão consciente: a busca por número de nota já entrega o PDF sem
+        # prova nenhuma, e nota é sequencial de 6 dígitos — o elo fraco é
+        # aquele, não este. Ver pendente-2026-09-04-busca-de-nota-por-numero.
+        if not req.invoiceNumber and req.documento:
+            if not documento_valido(req.documento):
+                raise HTTPException(
+                    422, "CPF/CNPJ inválido (dígito verificador não confere)."
+                )
+
+            opcoes = buscar_notas_por_documento(req.documento)
+            if not opcoes:
+                raise HTTPException(
+                    404,
+                    "Nenhuma nota fiscal localizada para esse CPF/CNPJ nos "
+                    f"últimos {EMAIL_JANELA_DIAS} dias.",
+                )
+            if len(opcoes) == 1:
+                unica = opcoes[0]
+                notas = resolver_uma_nota(unica.numero, unica.orderId)
+                if not notas:
+                    raise HTTPException(
+                        409,
+                        "Nota localizada no pedido, mas sem XML disponível ainda.",
+                    )
+                return RespostaOk(orderId=unica.orderId, notas=notas)
+            return RespostaOk(opcoes=opcoes)
+
         if not req.invoiceNumber:
             raise HTTPException(
-                422, "Informe orderId, invoiceNumber ou email + documento."
+                422, "Informe orderId, invoiceNumber, documento ou email + documento."
             )
 
         # 2a. já publicada? resolve pelo nome do arquivo, sem tocar na VTEX

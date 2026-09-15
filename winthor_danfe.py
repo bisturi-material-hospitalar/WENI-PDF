@@ -55,6 +55,21 @@ WINTHOR_BRANCH_ID = os.environ.get("WINTHOR_BRANCH_ID", "1")
 # vez de localizar a nota.
 RE_PEDIDO_WINTHOR = re.compile(r"\d{8,12}")
 
+# CPF tem 11 dígitos e cai dentro da faixa acima — um CPF enviado por engano no
+# lugar do pedido era reconhecido como pedido do ERP e disparava busca em todas
+# as filiais. Conferir o dígito verificador separa os dois sem estreitar a
+# faixa: número de pedido de 11 dígitos quase nunca fecha DV de CPF.
+# (Lógica duplicada do documento_valido da bridge de propósito — este módulo é
+# importado por ela, então não pode importar de volta.)
+def _dv_cpf(d: str) -> bool:
+    if len(set(d)) == 1:
+        return False
+    for corte in (9, 10):
+        soma = sum(int(d[j]) * ((corte + 1) - j) for j in range(corte))
+        if (soma * 10) % 11 % 10 != int(d[corte]):
+            return False
+    return True
+
 # Token vale por sessão do processo. O plano free do Render hiberna, então o
 # processo é novo com frequência e o cache raramente passa de alguns minutos —
 # mas evita um login por consulta durante um pico.
@@ -63,7 +78,12 @@ _TOKEN_TTL = 600.0
 
 
 def pedido_do_winthor(order_id: str) -> bool:
-    return bool(RE_PEDIDO_WINTHOR.fullmatch((order_id or "").strip()))
+    valor = (order_id or "").strip()
+    if not RE_PEDIDO_WINTHOR.fullmatch(valor):
+        return False
+    if len(valor) == 11 and _dv_cpf(valor):
+        return False          # é CPF, não pedido
+    return True
 
 
 def _headers() -> dict:
@@ -218,6 +238,94 @@ def pedido_por_numero_nota(invoice_number: str, documento: str) -> Optional[str]
         if len(itens) < NOTA_PAGE_SIZE:
             return None      # última página
 
+    return None
+
+
+def notas_do_cliente(documento: str, max_pedidos: int = 20) -> List[dict]:
+    """
+    CPF/CNPJ -> notas fiscais dos pedidos faturados mais recentes do cliente.
+
+    Devolve [{"numero", "orderId", "data_pedido", "valor"}], sem gerar PDF —
+    mesma forma do buscar_notas_por_email da bridge, para os dois caminhos
+    desembocarem na mesma lista de opções.
+
+    `max_pedidos` existe porque cada pedido faturado custa uma busca de XML:
+    montar a lista é caro e o cliente quer as notas recentes, não o histórico.
+    """
+    if not WINTHOR_URL:
+        return []
+
+    headers = _headers()
+    customer_id = _customer_id_por_documento(documento, headers)
+    if not customer_id:
+        return []
+
+    try:
+        resp = requests.get(
+            f"{WINTHOR_URL}/api/wholesale/v1/orders/list",
+            headers=headers,
+            params={
+                "customerId": customer_id,
+                "branchId": WINTHOR_BRANCH_ID,
+                "pageSize": NOTA_PAGE_SIZE,
+                "page": 1,
+            },
+            timeout=TIMEOUT,
+        )
+    except requests.exceptions.RequestException as erro:
+        raise HTTPException(502, f"Winthor não respondeu: {type(erro).__name__}")
+    if resp.status_code != 200:
+        return []
+
+    achadas: List[dict] = []
+    abertos = 0
+    for pedido in (resp.json() or {}).get("items") or []:
+        if abertos >= max_pedidos:
+            break
+        if pedido.get("orderStatus") != "F":
+            continue
+        order_id = str(pedido.get("orderId") or pedido.get("id") or "")
+        if not order_id:
+            continue
+        abertos += 1
+        xml = _xml_da_nfe(order_id, headers)
+        if not xml:
+            continue
+        numero = _nnf_do_xml(xml)
+        if not numero:
+            continue
+        achadas.append(
+            {
+                "numero": numero.lstrip("0") or numero,
+                "orderId": order_id,
+                "data_pedido": _data_br(pedido),
+                "valor": _valor_br(pedido),
+            }
+        )
+    return achadas
+
+
+def _data_br(pedido: dict) -> Optional[str]:
+    """Data do pedido em dd/mm/aaaa. O nome do campo varia por versão."""
+    for chave in ("createDate", "createData", "data", "orderDate"):
+        bruto = pedido.get(chave)
+        if not bruto:
+            continue
+        texto = str(bruto)[:10]
+        if "-" in texto:                      # 2026-09-15
+            partes = texto.split("-")
+            if len(partes) == 3:
+                return "%s/%s/%s" % (partes[2], partes[1], partes[0])
+        if "/" in texto:                      # já veio dd/mm/aaaa
+            return texto
+    return None
+
+
+def _valor_br(pedido: dict) -> Optional[str]:
+    for chave in ("TotalPrice", "totalPrice", "vltotal", "totalValue"):
+        bruto = pedido.get(chave)
+        if isinstance(bruto, (int, float)) and bruto > 0:
+            return ("R$ %0.2f" % bruto).replace(".", ",")
     return None
 
 
