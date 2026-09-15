@@ -122,6 +122,133 @@ def _status_do_pedido(order_id: str, headers: dict) -> Optional[str]:
     return encontrado
 
 
+# Varredura de nota por cliente. O Winthor não tem endpoint que localize
+# pedido pelo número da nota — invoiceDocument só aceita orderId — então o
+# caminho possível é o inverso: cliente, pedidos dele, NF-e de cada faturado.
+# Por isso essa busca exige CPF/CNPJ: sem ele não há por onde começar nem como
+# restringir a varredura a um cliente.
+#
+# Limites iguais aos do agente de consultas (NOTA_MAX_PAGINAS × NOTA_PAGE_SIZE
+# em consultar_pedido/main.py), de propósito: são duas implementações da mesma
+# varredura e devem envelhecer juntas.
+NOTA_MAX_PAGINAS = 3
+NOTA_PAGE_SIZE = 20
+
+
+def _customer_id_por_documento(documento: str, headers: dict) -> Optional[str]:
+    digitos = re.sub(r"\D", "", documento or "")
+    if not digitos:
+        return None
+    try:
+        resp = requests.get(
+            f"{WINTHOR_URL}/api/wholesale/v1/customer/list",
+            headers=headers,
+            params={"personIdentificationNumber": digitos},
+            timeout=TIMEOUT,
+        )
+    except requests.exceptions.RequestException as erro:
+        raise HTTPException(502, f"Winthor não respondeu: {type(erro).__name__}")
+    if resp.status_code != 200:
+        return None
+    itens = (resp.json() or {}).get("items") or []
+    if not itens:
+        return None
+    return str(itens[0].get("id") or itens[0].get("customerId") or "") or None
+
+
+def pedido_por_numero_nota(invoice_number: str, documento: str) -> Optional[str]:
+    """
+    Número da nota + CPF/CNPJ -> orderId do Winthor, ou None.
+
+    Varre os pedidos faturados mais recentes do cliente, do mais novo para o
+    mais antigo, comparando o nNF do XML com o número pedido. Nota mais antiga
+    que a janela não é encontrada por aqui — nesse caso o cliente informa o
+    número do pedido, que é busca direta.
+
+    Devolve só o orderId: quem chama passa esse id ao gerar_notas_do_pedido, que
+    já sabe buscar XML no Winthor e gerar o PDF. Assim não há segundo caminho de
+    geração para manter.
+    """
+    if not WINTHOR_URL:
+        raise HTTPException(503, "Consulta ao Winthor não configurada.")
+
+    alvo = str(invoice_number).strip().lstrip("0")
+    if not alvo:
+        return None
+
+    headers = _headers()
+    customer_id = _customer_id_por_documento(documento, headers)
+    if not customer_id:
+        return None
+
+    for page in range(1, NOTA_MAX_PAGINAS + 1):
+        try:
+            resp = requests.get(
+                f"{WINTHOR_URL}/api/wholesale/v1/orders/list",
+                headers=headers,
+                params={
+                    "customerId": customer_id,
+                    "branchId": WINTHOR_BRANCH_ID,
+                    "pageSize": NOTA_PAGE_SIZE,
+                    "page": page,
+                },
+                timeout=TIMEOUT,
+            )
+        except requests.exceptions.RequestException as erro:
+            raise HTTPException(502, f"Winthor não respondeu: {type(erro).__name__}")
+        if resp.status_code != 200:
+            return None
+
+        itens = (resp.json() or {}).get("items") or []
+        if not itens:
+            return None
+
+        for pedido in itens:
+            if pedido.get("orderStatus") != "F":
+                continue
+            order_id = str(pedido.get("orderId") or pedido.get("id") or "")
+            if not order_id:
+                continue
+            xml = _xml_da_nfe(order_id, headers)
+            if not xml:
+                continue
+            if (_nnf_do_xml(xml) or "").lstrip("0") == alvo:
+                return order_id
+
+        if len(itens) < NOTA_PAGE_SIZE:
+            return None      # última página
+
+    return None
+
+
+def _xml_da_nfe(order_id: str, headers: dict) -> Optional[str]:
+    """
+    XML da NF-e de um pedido faturado, ou None quando ainda não há documento.
+
+    Extraído para ser usado pelos dois caminhos — busca por pedido e varredura
+    por número de nota — em vez de duas cópias do mesmo request.
+    """
+    try:
+        resp = requests.get(
+            f"{WINTHOR_URL}/winthor/fiscal/v1/documentosfiscais/nfe/invoiceDocument",
+            headers=headers,
+            params={"orderId": order_id, "returnBase64": "false"},
+            timeout=TIMEOUT,
+        )
+    except requests.exceptions.RequestException as erro:
+        raise HTTPException(502, f"Winthor não respondeu: {type(erro).__name__}")
+
+    if resp.status_code == 404:
+        return None          # faturado sem documento fiscal ainda publicado
+    if resp.status_code != 200:
+        raise HTTPException(
+            502, f"Erro ao buscar NF-e no Winthor (HTTP {resp.status_code})."
+        )
+
+    xml = (resp.json() or {}).get("invoiceXml") or ""
+    return xml if xml.strip() else None
+
+
 def _nnf_do_xml(xml: str) -> Optional[str]:
     try:
         root = ET.fromstring(xml.encode("utf-8"))
@@ -167,26 +294,9 @@ def extrair_xmls_winthor(
     if status != "F":
         return []               # existe, mas ainda não faturado
 
-    try:
-        resp = requests.get(
-            f"{WINTHOR_URL}/winthor/fiscal/v1/documentosfiscais/nfe/invoiceDocument",
-            headers=headers,
-            params={"orderId": order_id, "returnBase64": "false"},
-            timeout=TIMEOUT,
-        )
-    except requests.exceptions.RequestException as erro:
-        raise HTTPException(502, f"Winthor não respondeu: {type(erro).__name__}")
-
-    if resp.status_code == 404:
+    xml = _xml_da_nfe(order_id, headers)
+    if not xml:
         return []               # faturado sem documento fiscal ainda publicado
-    if resp.status_code != 200:
-        raise HTTPException(
-            502, f"Erro ao buscar NF-e no Winthor (HTTP {resp.status_code})."
-        )
-
-    xml = (resp.json() or {}).get("invoiceXml") or ""
-    if not xml.strip():
-        return []
 
     numero = _nnf_do_xml(xml)
 

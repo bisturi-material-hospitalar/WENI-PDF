@@ -64,7 +64,11 @@ import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from winthor_danfe import extrair_xmls_winthor, pedido_do_winthor
+from winthor_danfe import (
+    extrair_xmls_winthor,
+    pedido_do_winthor,
+    pedido_por_numero_nota,
+)
 
 NS = {"nfe": "http://www.portalfiscal.inf.br/nfe"}
 STATUS_AUTORIZADOS = {"100", "150"}
@@ -1389,9 +1393,45 @@ def danfe(req: PedidoRequest, authorization: str = Header(None)):
                 % (req.invoiceNumber, fora_do_escopo[0]),
             )
         if not pedidos:
+            # 2c. a VTEX não conhece essa nota. Pode ser número errado, ou nota
+            # de pedido nascido no ERP — que não tem registro na VTEX e por isso
+            # nunca apareceria na busca acima.
+            #
+            # O Winthor não tem endpoint que ache pedido pelo número da nota, então
+            # a varredura parte do cliente e o CPF/CNPJ é obrigatório. Essa exigência
+            # vale só aqui: nota de compra pelo site continua sendo entregue com o
+            # número apenas, como sempre foi.
+            if req.documento:
+                if not documento_valido(req.documento):
+                    raise HTTPException(
+                        422, "CPF/CNPJ inválido (dígito verificador não confere)."
+                    )
+                pedido_erp = pedido_por_numero_nota(req.invoiceNumber, req.documento)
+                if pedido_erp:
+                    notas = gerar_notas_do_pedido(pedido_erp, req.invoiceNumber)
+                    if not notas:
+                        raise HTTPException(
+                            409,
+                            "Nota localizada no pedido, mas sem XML disponível ainda.",
+                        )
+                    return RespostaOk(orderId=pedido_erp, notas=notas)
+                raise HTTPException(
+                    404,
+                    f"Nota {req.invoiceNumber} não localizada. Confira o número.",
+                )
+
+            # Sem CPF/CNPJ não dá para procurar no ERP. 422 e não 404 porque é
+            # falta de parâmetro, não ausência do documento — mesma distinção já
+            # usada no caminho do e-mail.
             raise HTTPException(
-                404,
-                f"Nota {req.invoiceNumber} não localizada. Confira o número.",
+                422,
+                {
+                    "motivo": "falta_documento_nota",
+                    "mensagem": (
+                        "Nota não localizada entre as compras do site. Para "
+                        "procurar no ERP é preciso o CPF/CNPJ do cadastro."
+                    ),
+                },
             )
 
         notas = []
