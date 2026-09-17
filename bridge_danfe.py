@@ -139,6 +139,16 @@ EMAIL_MAX_OPCOES = int(os.environ.get("EMAIL_MAX_OPCOES", 8))
 RE_EMAIL_MASCARADO = re.compile(r"@ct\.vtex\.com\.br$|\.ct\.vtex\.com\.br$", re.I)
 
 
+def _diag(msg: str) -> None:
+    # Log de diagnóstico permanente (17/09) para o lado VTEX da busca de
+    # nota/pedido — mesmo objetivo do "_diag" equivalente em winthor_danfe.py:
+    # qualquer "não localizei" tem que dar para rastrear no log do Render até
+    # o ponto exato onde a busca parou (timeout, status HTTP, filtro que
+    # descartou o resultado), em vez de virar silêncio indistinguível de uma
+    # busca genuinamente vazia.
+    print(f"[bridge_danfe][diag] {msg}", flush=True)
+
+
 def pedido_do_site(order_id: str) -> bool:
     return bool(RE_PEDIDO_SITE.fullmatch((order_id or "").strip()))
 
@@ -300,18 +310,24 @@ class RespostaOk(BaseModel):
 def buscar_pedido_vtex(order_id: str) -> dict:
     account = os.environ["VTEX_ACCOUNT"]
     env = os.environ.get("VTEX_ENVIRONMENT", "vtexcommercestable")
-    resp = requests.get(
-        f"https://{account}.{env}.com.br/api/oms/pvt/orders/{order_id}",
-        headers={
-            "X-VTEX-API-AppKey": os.environ["VTEX_APP_KEY"],
-            "X-VTEX-API-AppToken": os.environ["VTEX_APP_TOKEN"],
-            "Accept": "application/json",
-        },
-        timeout=TIMEOUT,
-    )
+    try:
+        resp = requests.get(
+            f"https://{account}.{env}.com.br/api/oms/pvt/orders/{order_id}",
+            headers={
+                "X-VTEX-API-AppKey": os.environ["VTEX_APP_KEY"],
+                "X-VTEX-API-AppToken": os.environ["VTEX_APP_TOKEN"],
+                "Accept": "application/json",
+            },
+            timeout=TIMEOUT,
+        )
+    except requests.exceptions.RequestException as erro:
+        _diag(f"buscar_pedido_vtex: orderId={order_id} exceção — {type(erro).__name__}: {erro}")
+        raise HTTPException(502, f"VTEX não respondeu: {type(erro).__name__}")
     if resp.status_code == 404:
+        _diag(f"buscar_pedido_vtex: orderId={order_id} 404 na VTEX")
         raise HTTPException(404, f"Pedido {order_id} não encontrado na VTEX.")
     if resp.status_code != 200:
+        _diag(f"buscar_pedido_vtex: orderId={order_id} status={resp.status_code} corpo={resp.text[:300]!r}")
         raise HTTPException(502, f"VTEX retornou {resp.status_code}.")
     return resp.json()
 
@@ -341,17 +357,22 @@ def buscar_pedidos_por_nota(numero: str):
     numero = str(numero).strip().lstrip("0")
     account = os.environ["VTEX_ACCOUNT"]
     env = os.environ.get("VTEX_ENVIRONMENT", "vtexcommercestable")
-    resp = requests.get(
-        f"https://{account}.{env}.com.br/api/oms/pvt/orders",
-        params={"q": numero, "per_page": 15, "page": 1},
-        headers={
-            "X-VTEX-API-AppKey": os.environ["VTEX_APP_KEY"],
-            "X-VTEX-API-AppToken": os.environ["VTEX_APP_TOKEN"],
-            "Accept": "application/json",
-        },
-        timeout=TIMEOUT,
-    )
+    try:
+        resp = requests.get(
+            f"https://{account}.{env}.com.br/api/oms/pvt/orders",
+            params={"q": numero, "per_page": 15, "page": 1},
+            headers={
+                "X-VTEX-API-AppKey": os.environ["VTEX_APP_KEY"],
+                "X-VTEX-API-AppToken": os.environ["VTEX_APP_TOKEN"],
+                "Accept": "application/json",
+            },
+            timeout=TIMEOUT,
+        )
+    except requests.exceptions.RequestException as erro:
+        _diag(f"buscar_pedidos_por_nota: numero={numero} exceção — {type(erro).__name__}: {erro}")
+        raise HTTPException(502, f"VTEX não respondeu: {type(erro).__name__}")
     if resp.status_code != 200:
+        _diag(f"buscar_pedidos_por_nota: numero={numero} status={resp.status_code} corpo={resp.text[:300]!r}")
         raise HTTPException(502, f"VTEX retornou {resp.status_code} ao buscar a nota.")
 
     do_site, fora = [], []
@@ -363,6 +384,7 @@ def buscar_pedidos_por_nota(numero: str):
         if numero not in emitidas:
             continue
         (do_site if pedido_do_site(order_id) else fora).append(order_id)
+    _diag(f"buscar_pedidos_por_nota: numero={numero} do_site={do_site} fora_do_escopo={fora}")
     return do_site, fora
 
 
@@ -388,32 +410,42 @@ def buscar_notas_por_email(email: str, documento: str) -> List["OpcaoNota"]:
     doc = so_digitos(documento)
     account = os.environ["VTEX_ACCOUNT"]
     env = os.environ.get("VTEX_ENVIRONMENT", "vtexcommercestable")
-    resp = requests.get(
-        f"https://{account}.{env}.com.br/api/oms/pvt/orders",
-        params={
-            "q": email_norm,
-            "f_status": "invoiced",
-            "orderBy": "creationDate,desc",
-            "per_page": max(EMAIL_MAX_ABRIR, 15),
-            "page": 1,
-        },
-        headers={
-            "X-VTEX-API-AppKey": os.environ["VTEX_APP_KEY"],
-            "X-VTEX-API-AppToken": os.environ["VTEX_APP_TOKEN"],
-            "Accept": "application/json",
-        },
-        timeout=TIMEOUT,
-    )
+    try:
+        resp = requests.get(
+            f"https://{account}.{env}.com.br/api/oms/pvt/orders",
+            params={
+                "q": email_norm,
+                "f_status": "invoiced",
+                "orderBy": "creationDate,desc",
+                "per_page": max(EMAIL_MAX_ABRIR, 15),
+                "page": 1,
+            },
+            headers={
+                "X-VTEX-API-AppKey": os.environ["VTEX_APP_KEY"],
+                "X-VTEX-API-AppToken": os.environ["VTEX_APP_TOKEN"],
+                "Accept": "application/json",
+            },
+            timeout=TIMEOUT,
+        )
+    except requests.exceptions.RequestException as erro:
+        _diag(f"buscar_notas_por_email: exceção — {type(erro).__name__}: {erro}")
+        raise HTTPException(502, f"VTEX não respondeu: {type(erro).__name__}")
     if resp.status_code != 200:
+        _diag(f"buscar_notas_por_email: status={resp.status_code} corpo={resp.text[:300]!r}")
         raise HTTPException(
             502, f"VTEX retornou {resp.status_code} ao buscar pelo e-mail."
         )
 
+    itens_brutos = ((resp.json() or {}).get("list")) or []
+    _diag(f"buscar_notas_por_email: ?q= devolveu {len(itens_brutos)} pedido(s) para conferir")
+
     corte = datetime.now(timezone.utc) - timedelta(days=EMAIL_JANELA_DIAS)
     opcoes: List[OpcaoNota] = []
     abertos = 0
+    descartados_documento = 0
+    descartados_email = 0
 
-    for item in ((resp.json() or {}).get("list")) or []:
+    for item in itens_brutos:
         if len(opcoes) >= EMAIL_MAX_OPCOES or abertos >= EMAIL_MAX_ABRIR:
             break
 
@@ -439,8 +471,9 @@ def buscar_notas_por_email(email: str, documento: str) -> List["OpcaoNota"]:
         abertos += 1
         try:
             perfil = (buscar_pedido_vtex(order_id).get("clientProfileData")) or {}
-        except HTTPException:
+        except HTTPException as e:
             # um pedido que não abre não invalida a busca inteira
+            _diag(f"buscar_notas_por_email: orderId={order_id} não abriu — {e.status_code}: {e.detail}")
             continue
 
         documentos = {
@@ -448,6 +481,7 @@ def buscar_notas_por_email(email: str, documento: str) -> List["OpcaoNota"]:
             so_digitos(perfil.get("corporateDocument")),
         }
         if doc not in documentos:
+            descartados_documento += 1
             continue
 
         email_pedido = (perfil.get("email") or "").strip().lower()
@@ -456,6 +490,7 @@ def buscar_notas_por_email(email: str, documento: str) -> List["OpcaoNota"]:
             and not RE_EMAIL_MASCARADO.search(email_pedido)
             and email_pedido != email_norm
         ):
+            descartados_email += 1
             continue
 
         data_br = criado.strftime("%d/%m/%Y") if criado else None
@@ -469,6 +504,11 @@ def buscar_notas_por_email(email: str, documento: str) -> List["OpcaoNota"]:
                 )
             )
 
+    if not opcoes:
+        _diag(
+            f"buscar_notas_por_email: 0 opções ao final — abertos={abertos}, "
+            f"descartados_por_documento={descartados_documento}, descartados_por_email={descartados_email}"
+        )
     return opcoes[:EMAIL_MAX_OPCOES]
 
 
@@ -521,12 +561,19 @@ def buscar_notas_por_documento(documento: str):
             },
             timeout=TIMEOUT,
         )
-    except requests.exceptions.RequestException:
+    except requests.exceptions.RequestException as erro:
+        _diag(f"buscar_notas_por_documento: VTEX ?q= exceção — {type(erro).__name__}: {erro}")
         resp = None
 
+    if resp is not None and resp.status_code != 200:
+        _diag(f"buscar_notas_por_documento: VTEX ?q= status={resp.status_code} corpo={resp.text[:300]!r}")
+
     if resp is not None and resp.status_code == 200:
+        total_recebido = len((resp.json() or {}).get("list") or [])
         corte = datetime.now(timezone.utc) - timedelta(days=EMAIL_JANELA_DIAS)
         abertos = 0
+        descartados_marketplace = 0
+        descartados_documento = 0
         for item in ((resp.json() or {}).get("list")) or []:
             if len(opcoes) >= EMAIL_MAX_OPCOES or abertos >= EMAIL_MAX_ABRIR:
                 break
@@ -545,17 +592,20 @@ def buscar_notas_por_documento(documento: str):
                 # nota existe, mas é de marketplace: fora deste fluxo. Marca e
                 # segue — a marcação só importa se nada do site for achado.
                 tem_marketplace = True
+                descartados_marketplace += 1
                 continue
             abertos += 1
             try:
                 perfil = (buscar_pedido_vtex(order_id).get("clientProfileData")) or {}
-            except HTTPException:
+            except HTTPException as erro:
+                _diag(f"buscar_notas_por_documento: orderId={order_id} buscar_pedido_vtex falhou — {erro.status_code}: {erro.detail}")
                 continue
             documentos = {
                 so_digitos(perfil.get("document")),
                 so_digitos(perfil.get("corporateDocument")),
             }
             if doc not in documentos:
+                descartados_documento += 1
                 continue
             data_br = criado.strftime("%d/%m/%Y") if criado else None
             for numero in emitidas:
@@ -567,13 +617,23 @@ def buscar_notas_por_documento(documento: str):
                         valor=_valor_brl(item.get("totalValue")),
                     )
                 )
+        _diag(
+            f"buscar_notas_por_documento: VTEX ?q= doc={doc} recebidos={total_recebido} "
+            f"abertos={abertos} descartados_marketplace={descartados_marketplace} "
+            f"descartados_documento_nao_bate={descartados_documento} opcoes_ate_aqui={len(opcoes)}"
+        )
+    elif resp is None:
+        _diag(f"buscar_notas_por_documento: VTEX ?q= doc={doc} não respondeu (exceção acima) — seguindo só com ERP")
 
     # ---- origem 2: ERP ----
+    opcoes_antes_do_erp = len(opcoes)
     if len(opcoes) < EMAIL_MAX_OPCOES:
         try:
+            achadas_erp = 0
             for achada in notas_do_cliente(doc):
                 if len(opcoes) >= EMAIL_MAX_OPCOES:
                     break
+                achadas_erp += 1
                 opcoes.append(
                     OpcaoNota(
                         numero=achada["numero"],
@@ -582,10 +642,18 @@ def buscar_notas_por_documento(documento: str):
                         valor=achada.get("valor"),
                     )
                 )
-        except HTTPException:
-            # ERP fora do ar não invalida o que a VTEX já achou
-            pass
+            _diag(f"buscar_notas_por_documento: ERP doc={doc} achadas={achadas_erp}")
+        except HTTPException as erro:
+            # ERP fora do ar não invalida o que a VTEX já achou — mas se a VTEX
+            # também não tinha nada (opcoes_antes_do_erp == 0), o cliente recebe
+            # "não localizei" quando o correto seria "não consegui verificar agora".
+            _diag(
+                f"buscar_notas_por_documento: ERP falhou — {erro.status_code}: {erro.detail} — "
+                f"opcoes_ja_achadas_na_vtex={opcoes_antes_do_erp} "
+                f"({'falso negativo provável' if opcoes_antes_do_erp == 0 else 'VTEX já tinha resultado, falha do ERP não afeta a resposta'})"
+            )
 
+    _diag(f"buscar_notas_por_documento: doc={doc} total_opcoes={len(opcoes)} tem_marketplace={tem_marketplace}")
     return opcoes, tem_marketplace
 
 
@@ -599,16 +667,30 @@ def extrair_xmls(pedido: dict, invoice_number: Optional[str] = None) -> List[dic
 
     TESTADO ✅ com estrutura de pedido real e com casos de borda.
     """
+    order_id = (pedido.get("orderId") or pedido.get("sequence") or "").strip() if isinstance(pedido, dict) else ""
     pacotes = ((pedido.get("packageAttachment") or {}).get("packages")) or []
+    if not pacotes:
+        _diag(f"extrair_xmls: orderId={order_id!r} sem packageAttachment.packages (pedido não faturado ou sem pacote)")
+        return []
+    sem_embedded = 0
+    descartados_por_numero = 0
     achados = []
     for p in pacotes:
         xml = p.get("embeddedInvoice")
         if not xml:
+            sem_embedded += 1
             continue
         num = str(p.get("invoiceNumber") or "").strip()
         if invoice_number and num != str(invoice_number).strip():
+            descartados_por_numero += 1
             continue
         achados.append({"xml": xml, "invoiceNumber": num})
+    if not achados:
+        _diag(
+            f"extrair_xmls: orderId={order_id!r} invoice_number={invoice_number!r} "
+            f"pacotes={len(pacotes)} sem_embeddedInvoice={sem_embedded} "
+            f"descartados_por_numero_diferente={descartados_por_numero} — nenhum XML retornado"
+        )
     return achados
 
 

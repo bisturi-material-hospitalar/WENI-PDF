@@ -45,6 +45,16 @@ WINTHOR_LOGIN = os.environ.get("WINTHOR_LOGIN", "")
 WINTHOR_SENHA_MD5 = os.environ.get("WINTHOR_SENHA_MD5", "")
 WINTHOR_BRANCH_ID = os.environ.get("WINTHOR_BRANCH_ID", "1")
 
+
+def _diag(msg: str) -> None:
+    # Log de diagnóstico permanente (17/09) para o lado Winthor da busca de
+    # nota/pedido. Objetivo: qualquer "não localizei" devolvido ao cliente tem
+    # que ser rastreável no log do Render até o ponto exato onde a busca parou
+    # — sem timeout de rede, filial errada ou falha de auth virando silêncio.
+    # Ver também o "_diag" equivalente do lado VTEX em bridge_danfe.py.
+    print(f"[winthor_danfe][diag] {msg}", flush=True)
+
+
 # O pedido do site tem hífen (RE_PEDIDO_SITE = r"\d+-\d+"). O do Winthor é só
 # dígitos, com o código do RCA como prefixo: 257000098 é RCA 257, 69323074 é
 # RCA 69. Não validamos o RCA aqui — prefixo novo não deve derrubar a consulta.
@@ -91,17 +101,23 @@ def _headers() -> dict:
     if _TOKEN_CACHE["valor"] and agora < _TOKEN_CACHE["expira_em"]:
         token = _TOKEN_CACHE["valor"]
     else:
-        resp = requests.post(
-            f"{WINTHOR_URL}/winthor/autenticacao/v1/login",
-            json={"login": WINTHOR_LOGIN, "senha": WINTHOR_SENHA_MD5},
-            timeout=TIMEOUT,
-        )
+        try:
+            resp = requests.post(
+                f"{WINTHOR_URL}/winthor/autenticacao/v1/login",
+                json={"login": WINTHOR_LOGIN, "senha": WINTHOR_SENHA_MD5},
+                timeout=TIMEOUT,
+            )
+        except requests.exceptions.RequestException as erro:
+            _diag(f"_headers: exceção no login — {type(erro).__name__}: {erro}")
+            raise HTTPException(502, f"Winthor não respondeu (login): {type(erro).__name__}")
         if resp.status_code != 200:
+            _diag(f"_headers: login status={resp.status_code} corpo={resp.text[:300]!r}")
             raise HTTPException(
                 502, f"Falha de autenticação no Winthor (HTTP {resp.status_code})."
             )
         token = resp.json().get("accessToken") or ""
         if not token:
+            _diag("_headers: login 200 mas sem accessToken no corpo")
             raise HTTPException(502, "Winthor não devolveu accessToken.")
         _TOKEN_CACHE.update(valor=token, expira_em=agora + _TOKEN_TTL)
 
@@ -131,14 +147,19 @@ def _status_do_pedido(order_id: str, headers: dict) -> Optional[str]:
                 params={"orderId": order_id, "branchId": filial},
                 timeout=TIMEOUT,
             )
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as erro:
+            _diag(f"_status_do_pedido: orderId={order_id} filial={filial} exceção — {type(erro).__name__}: {erro}")
             continue
         if resp.status_code != 200:
+            _diag(f"_status_do_pedido: orderId={order_id} filial={filial} status={resp.status_code}")
             continue
         status = (resp.json() or {}).get("orderStatus") or ""
+        _diag(f"_status_do_pedido: orderId={order_id} filial={filial} orderStatus={status!r}")
         if status == "F":
             return "F"          # faturado: para de procurar
         encontrado = encontrado or status
+    if encontrado is None:
+        _diag(f"_status_do_pedido: orderId={order_id} não achado em nenhuma filial de {filiais}")
     return encontrado
 
 
@@ -163,13 +184,6 @@ NOTA_PAGE_SIZE = 20
 # VTEX (EMAIL_JANELA_DIAS, bridge_danfe.py) para os dois lados da busca por
 # documento cobrirem o mesmo período.
 WINTHOR_JANELA_DIAS = 180
-
-
-def _diag(msg: str) -> None:
-    # Diagnóstico temporário (17/09) para decidir se o "não localizei" é
-    # busca vazia de verdade ou falha antes de chegar no orders/list.
-    # Remover depois de confirmado o daysOfSearch em produção.
-    print(f"[winthor_danfe][diag] {msg}", flush=True)
 
 
 def _customer_id_por_documento(documento: str, headers: dict) -> Optional[str]:
@@ -406,16 +420,21 @@ def _xml_da_nfe(order_id: str, headers: dict) -> Optional[str]:
             timeout=TIMEOUT,
         )
     except requests.exceptions.RequestException as erro:
+        _diag(f"_xml_da_nfe: orderId={order_id} exceção — {type(erro).__name__}: {erro}")
         raise HTTPException(502, f"Winthor não respondeu: {type(erro).__name__}")
 
     if resp.status_code == 404:
+        _diag(f"_xml_da_nfe: orderId={order_id} 404 (faturado sem documento fiscal ainda)")
         return None          # faturado sem documento fiscal ainda publicado
     if resp.status_code != 200:
+        _diag(f"_xml_da_nfe: orderId={order_id} status={resp.status_code} corpo={resp.text[:300]!r}")
         raise HTTPException(
             502, f"Erro ao buscar NF-e no Winthor (HTTP {resp.status_code})."
         )
 
     xml = (resp.json() or {}).get("invoiceXml") or ""
+    if not xml.strip():
+        _diag(f"_xml_da_nfe: orderId={order_id} 200 mas invoiceXml vazio")
     return xml if xml.strip() else None
 
 
@@ -452,23 +471,28 @@ def extrair_xmls_winthor(
     chama decide se usa; nada aqui muda de comportamento por causa dele.
     """
     if not WINTHOR_URL:
+        _diag(f"extrair_xmls_winthor: orderId={order_id} WINTHOR_URL vazio")
         raise HTTPException(503, "Consulta ao Winthor não configurada.")
 
     headers = _headers()
     status = _status_do_pedido(order_id, headers)
 
     if status is None:
+        _diag(f"extrair_xmls_winthor: orderId={order_id} não localizado em nenhuma filial")
         raise HTTPException(404, f"Pedido {order_id} não localizado.")
     if info_saida is not None:
         info_saida["orderStatus"] = status
     if status != "F":
+        _diag(f"extrair_xmls_winthor: orderId={order_id} status={status!r} (não faturado ainda)")
         return []               # existe, mas ainda não faturado
 
     xml = _xml_da_nfe(order_id, headers)
     if not xml:
-        return []               # faturado sem documento fiscal ainda publicado
+        return []               # faturado sem documento fiscal ainda publicado; _xml_da_nfe já logou
 
     numero = _nnf_do_xml(xml)
+    if not numero:
+        _diag(f"extrair_xmls_winthor: orderId={order_id} teve XML mas sem nNF extraível")
 
     # Se a consulta veio pelo número da nota, confere que é esta mesma. Sem
     # isso, um pedido com nota diferente da pedida devolveria o documento
@@ -476,6 +500,10 @@ def extrair_xmls_winthor(
     if invoice_number:
         pedido_num = str(invoice_number).strip().lstrip("0")
         if (numero or "").lstrip("0") != pedido_num:
+            _diag(
+                f"extrair_xmls_winthor: orderId={order_id} nNF={numero!r} não bate "
+                f"com invoice_number pedido={pedido_num!r}"
+            )
             return []
 
     return [{"xml": xml, "invoiceNumber": numero or ""}]
