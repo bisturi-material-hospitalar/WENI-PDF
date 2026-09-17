@@ -165,9 +165,20 @@ NOTA_PAGE_SIZE = 20
 WINTHOR_JANELA_DIAS = 180
 
 
+def _diag(msg: str) -> None:
+    # Diagnóstico temporário (17/09) para decidir se o "não localizei" é
+    # busca vazia de verdade ou falha antes de chegar no orders/list.
+    # Remover depois de confirmado o daysOfSearch em produção.
+    print(f"[winthor_danfe][diag] {msg}", flush=True)
+
+
 def _customer_id_por_documento(documento: str, headers: dict) -> Optional[str]:
     digitos = re.sub(r"\D", "", documento or "")
     if not digitos:
+        _diag(f"customer_id: documento vazio depois de normalizar ({documento!r})")
+        return None
+    if not WINTHOR_URL:
+        _diag("customer_id: WINTHOR_URL vazio, não chamou o Winthor")
         return None
     try:
         resp = requests.get(
@@ -177,13 +188,18 @@ def _customer_id_por_documento(documento: str, headers: dict) -> Optional[str]:
             timeout=TIMEOUT,
         )
     except requests.exceptions.RequestException as erro:
+        _diag(f"customer_id: exceção ao chamar customer/list — {type(erro).__name__}: {erro}")
         raise HTTPException(502, f"Winthor não respondeu: {type(erro).__name__}")
     if resp.status_code != 200:
+        _diag(f"customer_id: customer/list status={resp.status_code} corpo={resp.text[:300]!r}")
         return None
     itens = (resp.json() or {}).get("items") or []
     if not itens:
+        _diag(f"customer_id: customer/list 200 mas items=[] para documento={digitos}")
         return None
-    return str(itens[0].get("id") or itens[0].get("customerId") or "") or None
+    achado = str(itens[0].get("id") or itens[0].get("customerId") or "") or None
+    _diag(f"customer_id: achado customer_id={achado} para documento={digitos}")
+    return achado
 
 
 def pedido_por_numero_nota(invoice_number: str, documento: str) -> Optional[str]:
@@ -264,11 +280,13 @@ def notas_do_cliente(documento: str, max_pedidos: int = 20) -> List[dict]:
     montar a lista é caro e o cliente quer as notas recentes, não o histórico.
     """
     if not WINTHOR_URL:
+        _diag("notas_do_cliente: WINTHOR_URL vazio, retornando [] sem chamar o Winthor")
         return []
 
     headers = _headers()
     customer_id = _customer_id_por_documento(documento, headers)
     if not customer_id:
+        _diag(f"notas_do_cliente: sem customer_id para documento={documento!r}, retornando []")
         return []
 
     try:
@@ -285,13 +303,23 @@ def notas_do_cliente(documento: str, max_pedidos: int = 20) -> List[dict]:
             timeout=TIMEOUT,
         )
     except requests.exceptions.RequestException as erro:
+        _diag(f"notas_do_cliente: exceção ao chamar orders/list — {type(erro).__name__}: {erro}")
         raise HTTPException(502, f"Winthor não respondeu: {type(erro).__name__}")
     if resp.status_code != 200:
+        _diag(f"notas_do_cliente: orders/list status={resp.status_code} corpo={resp.text[:300]!r}")
         return []
+
+    itens_brutos = (resp.json() or {}).get("items") or []
+    _diag(
+        f"notas_do_cliente: orders/list 200, customerId={customer_id}, "
+        f"branchId={WINTHOR_BRANCH_ID}, daysOfSearch={WINTHOR_JANELA_DIAS}, "
+        f"itens={len(itens_brutos)}, orderStatus_vistos={[p.get('orderStatus') for p in itens_brutos]}, "
+        f"orderIds={[p.get('orderId') or p.get('id') for p in itens_brutos]}"
+    )
 
     achadas: List[dict] = []
     abertos = 0
-    for pedido in (resp.json() or {}).get("items") or []:
+    for pedido in itens_brutos:
         if abertos >= max_pedidos:
             break
         if pedido.get("orderStatus") != "F":
@@ -302,9 +330,11 @@ def notas_do_cliente(documento: str, max_pedidos: int = 20) -> List[dict]:
         abertos += 1
         xml = _xml_da_nfe(order_id, headers)
         if not xml:
+            _diag(f"notas_do_cliente: orderId={order_id} sem XML de NF-e (invoiceDocument vazio/erro)")
             continue
         numero = _nnf_do_xml(xml)
         if not numero:
+            _diag(f"notas_do_cliente: orderId={order_id} teve XML mas sem nNF extraível")
             continue
         achadas.append(
             {
