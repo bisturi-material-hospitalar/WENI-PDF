@@ -154,6 +154,16 @@ def _status_do_pedido(order_id: str, headers: dict) -> Optional[str]:
 NOTA_MAX_PAGINAS = 3
 NOTA_PAGE_SIZE = 20
 
+# Sem "daysOfSearch", a Winthor devolve só pedidos ALTERADOS nos últimos 15
+# dias (não criados — alterados) e faz isso em silêncio: não erra, só devolve
+# lista vazia. Confirmado em produção em 17/09 (CPF 14426066735, pedido
+# 257000048, nota 372301, faturado 28/08 — 20 dias antes da consulta, fora do
+# piso de 15 e por isso ausente do resultado; o cliente tinha nota, o caminho
+# é que não buscava longe o suficiente). Usa o mesmo tamanho de janela do lado
+# VTEX (EMAIL_JANELA_DIAS, bridge_danfe.py) para os dois lados da busca por
+# documento cobrirem o mesmo período.
+WINTHOR_JANELA_DIAS = 180
+
 
 def _customer_id_por_documento(documento: str, headers: dict) -> Optional[str]:
     digitos = re.sub(r"\D", "", documento or "")
@@ -211,6 +221,7 @@ def pedido_por_numero_nota(invoice_number: str, documento: str) -> Optional[str]
                     "branchId": WINTHOR_BRANCH_ID,
                     "pageSize": NOTA_PAGE_SIZE,
                     "page": page,
+                    "daysOfSearch": WINTHOR_JANELA_DIAS,
                 },
                 timeout=TIMEOUT,
             )
@@ -269,6 +280,7 @@ def notas_do_cliente(documento: str, max_pedidos: int = 20) -> List[dict]:
                 "branchId": WINTHOR_BRANCH_ID,
                 "pageSize": NOTA_PAGE_SIZE,
                 "page": 1,
+                "daysOfSearch": WINTHOR_JANELA_DIAS,
             },
             timeout=TIMEOUT,
         )
