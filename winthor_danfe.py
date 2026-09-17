@@ -227,43 +227,53 @@ def pedido_por_numero_nota(invoice_number: str, documento: str) -> Optional[str]
     if not customer_id:
         return None
 
-    for page in range(1, NOTA_MAX_PAGINAS + 1):
-        try:
-            resp = requests.get(
-                f"{WINTHOR_URL}/api/wholesale/v1/orders/list",
-                headers=headers,
-                params={
-                    "customerId": customer_id,
-                    "branchId": WINTHOR_BRANCH_ID,
-                    "pageSize": NOTA_PAGE_SIZE,
-                    "page": page,
-                    "daysOfSearch": WINTHOR_JANELA_DIAS,
-                },
-                timeout=TIMEOUT,
-            )
-        except requests.exceptions.RequestException as erro:
-            raise HTTPException(502, f"Winthor não respondeu: {type(erro).__name__}")
-        if resp.status_code != 200:
-            return None
-
-        itens = (resp.json() or {}).get("items") or []
-        if not itens:
-            return None
-
-        for pedido in itens:
-            if pedido.get("orderStatus") != "F":
+    # Mesmo furo do _status_do_pedido: orders/list aceita um branchId só, e a
+    # Bisturi tem três lojas emitindo (+ e-commerce). Buscar só na primeira
+    # filial faz nota de outra filial parecer inexistente. Confirmado em
+    # produção em 17/09: customerId achado, mas orders/list com branchId="1"
+    # sozinho devolveu itens=0 para um cliente com pedido faturado real.
+    filiais = [f.strip() for f in WINTHOR_BRANCH_ID.split(",") if f.strip()]
+    for filial in filiais:
+        for page in range(1, NOTA_MAX_PAGINAS + 1):
+            try:
+                resp = requests.get(
+                    f"{WINTHOR_URL}/api/wholesale/v1/orders/list",
+                    headers=headers,
+                    params={
+                        "customerId": customer_id,
+                        "branchId": filial,
+                        "pageSize": NOTA_PAGE_SIZE,
+                        "page": page,
+                        "daysOfSearch": WINTHOR_JANELA_DIAS,
+                    },
+                    timeout=TIMEOUT,
+                )
+            except requests.exceptions.RequestException as erro:
+                _diag(f"pedido_por_numero_nota: exceção na filial={filial} — {type(erro).__name__}: {erro}")
                 continue
-            order_id = str(pedido.get("orderId") or pedido.get("id") or "")
-            if not order_id:
-                continue
-            xml = _xml_da_nfe(order_id, headers)
-            if not xml:
-                continue
-            if (_nnf_do_xml(xml) or "").lstrip("0") == alvo:
-                return order_id
+            if resp.status_code != 200:
+                _diag(f"pedido_por_numero_nota: filial={filial} status={resp.status_code}")
+                break  # próxima filial
 
-        if len(itens) < NOTA_PAGE_SIZE:
-            return None      # última página
+            itens = (resp.json() or {}).get("items") or []
+            _diag(f"pedido_por_numero_nota: filial={filial} page={page} itens={len(itens)}")
+            if not itens:
+                break  # próxima filial
+
+            for pedido in itens:
+                if pedido.get("orderStatus") != "F":
+                    continue
+                order_id = str(pedido.get("orderId") or pedido.get("id") or "")
+                if not order_id:
+                    continue
+                xml = _xml_da_nfe(order_id, headers)
+                if not xml:
+                    continue
+                if (_nnf_do_xml(xml) or "").lstrip("0") == alvo:
+                    return order_id
+
+            if len(itens) < NOTA_PAGE_SIZE:
+                break  # última página desta filial, próxima filial
 
     return None
 
@@ -289,61 +299,71 @@ def notas_do_cliente(documento: str, max_pedidos: int = 20) -> List[dict]:
         _diag(f"notas_do_cliente: sem customer_id para documento={documento!r}, retornando []")
         return []
 
-    try:
-        resp = requests.get(
-            f"{WINTHOR_URL}/api/wholesale/v1/orders/list",
-            headers=headers,
-            params={
-                "customerId": customer_id,
-                "branchId": WINTHOR_BRANCH_ID,
-                "pageSize": NOTA_PAGE_SIZE,
-                "page": 1,
-                "daysOfSearch": WINTHOR_JANELA_DIAS,
-            },
-            timeout=TIMEOUT,
-        )
-    except requests.exceptions.RequestException as erro:
-        _diag(f"notas_do_cliente: exceção ao chamar orders/list — {type(erro).__name__}: {erro}")
-        raise HTTPException(502, f"Winthor não respondeu: {type(erro).__name__}")
-    if resp.status_code != 200:
-        _diag(f"notas_do_cliente: orders/list status={resp.status_code} corpo={resp.text[:300]!r}")
-        return []
-
-    itens_brutos = (resp.json() or {}).get("items") or []
-    _diag(
-        f"notas_do_cliente: orders/list 200, customerId={customer_id}, "
-        f"branchId={WINTHOR_BRANCH_ID}, daysOfSearch={WINTHOR_JANELA_DIAS}, "
-        f"itens={len(itens_brutos)}, orderStatus_vistos={[p.get('orderStatus') for p in itens_brutos]}, "
-        f"orderIds={[p.get('orderId') or p.get('id') for p in itens_brutos]}"
-    )
-
+    # Mesmo furo do _status_do_pedido, confirmado em produção em 17/09: com
+    # WINTHOR_BRANCH_ID="1" sozinho, orders/list devolveu itens=0 pra um
+    # cliente com customer_id achado e pedido faturado real (nota 372301,
+    # pedido 257000048). A Bisturi tem três lojas emitindo (+ e-commerce) —
+    # cada uma é uma filial diferente, e orders/list só aceita um branchId
+    # por chamada. Varre todas as filiais configuradas, não só a primeira.
+    filiais = [f.strip() for f in WINTHOR_BRANCH_ID.split(",") if f.strip()]
     achadas: List[dict] = []
     abertos = 0
-    for pedido in itens_brutos:
+    for filial in filiais:
         if abertos >= max_pedidos:
             break
-        if pedido.get("orderStatus") != "F":
+        try:
+            resp = requests.get(
+                f"{WINTHOR_URL}/api/wholesale/v1/orders/list",
+                headers=headers,
+                params={
+                    "customerId": customer_id,
+                    "branchId": filial,
+                    "pageSize": NOTA_PAGE_SIZE,
+                    "page": 1,
+                    "daysOfSearch": WINTHOR_JANELA_DIAS,
+                },
+                timeout=TIMEOUT,
+            )
+        except requests.exceptions.RequestException as erro:
+            _diag(f"notas_do_cliente: exceção na filial={filial} — {type(erro).__name__}: {erro}")
             continue
-        order_id = str(pedido.get("orderId") or pedido.get("id") or "")
-        if not order_id:
+        if resp.status_code != 200:
+            _diag(f"notas_do_cliente: filial={filial} status={resp.status_code} corpo={resp.text[:300]!r}")
             continue
-        abertos += 1
-        xml = _xml_da_nfe(order_id, headers)
-        if not xml:
-            _diag(f"notas_do_cliente: orderId={order_id} sem XML de NF-e (invoiceDocument vazio/erro)")
-            continue
-        numero = _nnf_do_xml(xml)
-        if not numero:
-            _diag(f"notas_do_cliente: orderId={order_id} teve XML mas sem nNF extraível")
-            continue
-        achadas.append(
-            {
-                "numero": numero.lstrip("0") or numero,
-                "orderId": order_id,
-                "data_pedido": _data_br(pedido),
-                "valor": _valor_br(pedido),
-            }
+
+        itens_brutos = (resp.json() or {}).get("items") or []
+        _diag(
+            f"notas_do_cliente: filial={filial}, customerId={customer_id}, "
+            f"daysOfSearch={WINTHOR_JANELA_DIAS}, itens={len(itens_brutos)}, "
+            f"orderStatus_vistos={[p.get('orderStatus') for p in itens_brutos]}, "
+            f"orderIds={[p.get('orderId') or p.get('id') for p in itens_brutos]}"
         )
+
+        for pedido in itens_brutos:
+            if abertos >= max_pedidos:
+                break
+            if pedido.get("orderStatus") != "F":
+                continue
+            order_id = str(pedido.get("orderId") or pedido.get("id") or "")
+            if not order_id:
+                continue
+            abertos += 1
+            xml = _xml_da_nfe(order_id, headers)
+            if not xml:
+                _diag(f"notas_do_cliente: orderId={order_id} sem XML de NF-e (invoiceDocument vazio/erro)")
+                continue
+            numero = _nnf_do_xml(xml)
+            if not numero:
+                _diag(f"notas_do_cliente: orderId={order_id} teve XML mas sem nNF extraível")
+                continue
+            achadas.append(
+                {
+                    "numero": numero.lstrip("0") or numero,
+                    "orderId": order_id,
+                    "data_pedido": _data_br(pedido),
+                    "valor": _valor_br(pedido),
+                }
+            )
     return achadas
 
 
