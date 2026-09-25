@@ -442,9 +442,14 @@ def gerar_pdf(dados: dict, caminho=None) -> bytes:
     fluxo += [
         aviso,
         Paragraph(
-            "Este documento é uma cotação: preços e disponibilidade do momento da consulta, "
-            "sujeitos a confirmação pelo time de vendas. Não reserva estoque, não inclui frete "
-            "e não substitui o pedido.", NOTA),
+            # Decisao comercial de 25/09/2026: a loja honra o preco por 24 horas. O texto
+            # anterior punha "precos e disponibilidade ... sujeitos a confirmacao pelo time
+            # de vendas", o que contradizia a propria linha de cima do documento
+            # ("Cotação válida por 24 horas") e a garantia que a loja assumiu. A ressalva
+            # agora cai so sobre a disponibilidade, que e o que de fato depende do time.
+            "Este documento é uma cotação: o preço vale por 24 horas a partir da emissão. "
+            "A disponibilidade é a do momento da consulta e é confirmada pelo time de "
+            "vendas. Não reserva estoque, não inclui frete e não substitui o pedido.", NOTA),
         AreaProtegida(),
     ]
 
